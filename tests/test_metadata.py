@@ -5,12 +5,13 @@ import sys
 import pytest
 
 from conda_build.metadata import select_lines, MetaData
-from conda_build import api, conda_interface, render
+from conda_build import api, conda_interface
 from .utils import thisdir, metadata_dir
 
 
 def test_uses_vcs_in_metadata(testing_workdir, testing_metadata):
-    testing_metadata.meta_path = os.path.join(testing_workdir, 'meta.yaml')
+    testing_metadata._meta_path = os.path.join(testing_workdir, 'meta.yaml')
+    testing_metadata._meta_name = 'meta.yaml'
     with open(testing_metadata.meta_path, 'w') as f:
         f.write('http://hg.something.com')
     assert not testing_metadata.uses_vcs_in_meta
@@ -88,7 +89,7 @@ def test_disallow_dash_in_features(testing_metadata):
 def test_append_section_data(testing_metadata):
     testing_metadata.final = False
     testing_metadata.parse_again()
-    requirements_len = len(testing_metadata.meta['requirements']['build'])
+    requirements_len = len(testing_metadata.meta['requirements'].get('build', []))
     testing_metadata.config.append_sections_file = os.path.join(thisdir, 'test-append.yaml')
     testing_metadata.final = False
     testing_metadata.parse_again()
@@ -106,9 +107,10 @@ def test_clobber_section_data(testing_metadata):
     testing_metadata.meta['about']['home'] = 'sweet home'
 
 
+@pytest.mark.serial
 def test_build_bootstrap_env_by_name(testing_metadata):
-    assert not any("git" in pkg for pkg in testing_metadata.meta["requirements"]["build"]), \
-        testing_metadata.meta["requirements"]["build"]
+    assert not any("git" in pkg for pkg in testing_metadata.meta["requirements"].get("build", [])), \
+        testing_metadata.meta["requirements"].get("build", [])
     try:
         cmd = "conda create -y -n conda_build_bootstrap_test git"
         subprocess.check_call(cmd.split())
@@ -123,8 +125,8 @@ def test_build_bootstrap_env_by_name(testing_metadata):
 
 
 def test_build_bootstrap_env_by_path(testing_metadata):
-    assert not any("git" in pkg for pkg in testing_metadata.meta["requirements"]["build"]), \
-        testing_metadata.meta["requirements"]["build"]
+    assert not any("git" in pkg for pkg in testing_metadata.meta["requirements"].get("build", [])), \
+        testing_metadata.meta["requirements"].get("build", [])
     path = os.path.join(thisdir, "conda_build_bootstrap_test")
     try:
         cmd = "conda create -y -p {} git".format(path)
@@ -141,7 +143,7 @@ def test_build_bootstrap_env_by_path(testing_metadata):
 
 @pytest.mark.parametrize('py_ver', [('2.7', 'vs2008_win-x86_64'),
                                     ('3.4', 'vs2010_win-x86_64'),
-                                    ('3.5', 'vs2015_win-x86_64'), ])
+                                    ('3.7', 'vs2017_win-x86_64'), ])
 def test_native_compiler_metadata_win(testing_config, py_ver, mocker):
     testing_config.platform = 'win'
     metadata = api.render(os.path.join(metadata_dir, '_compiler_jinja2'), config=testing_config,
@@ -186,14 +188,16 @@ def test_compiler_metadata_cross_compiler():
 
 
 def test_hash_build_id(testing_metadata):
-    testing_metadata.meta['requirements']['build'] = ['zlib 1.2.8']
+    testing_metadata.config.variant['zlib'] = '1.2'
+    testing_metadata.meta['requirements']['host'] = ['zlib']
     testing_metadata.final = True
-    assert testing_metadata.hash_dependencies() == 'h90ec539'
-    assert testing_metadata.build_id() == 'h90ec539_1'
+    assert testing_metadata.get_hash_contents() == {'zlib': '1.2'}
+    assert testing_metadata.hash_dependencies() == 'h1341992'
+    assert testing_metadata.build_id() == 'h1341992_1'
 
 
 def test_hash_build_id_key_order(testing_metadata):
-    deps = testing_metadata.meta['requirements']['build'][:]
+    deps = testing_metadata.meta['requirements'].get('build', [])[:]
 
     # first, prepend
     newdeps = deps[:]

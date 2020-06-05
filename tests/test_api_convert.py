@@ -2,6 +2,7 @@ import csv
 import os
 import json
 import tarfile
+import hashlib
 
 import pytest
 
@@ -50,7 +51,7 @@ def test_show_imports(testing_workdir, base_platform, package, capfd):
         if platform == source_platform:
             platforms.remove(platform)
 
-    f = 'http://repo.continuum.io/pkgs/free/{}-64/{}-py36_0.tar.bz2'.format(base_platform,
+    f = 'http://repo.anaconda.com/pkgs/free/{}-64/{}-py36_0.tar.bz2'.format(base_platform,
                                                                             package_name)
     fn = "{}-py36_0.tar.bz2".format(package_name)
     download(f, fn)
@@ -72,7 +73,7 @@ def test_show_imports(testing_workdir, base_platform, package, capfd):
 def test_no_imports_found(testing_workdir, base_platform, package, capfd):
     package_name, example_file = package
 
-    f = 'http://repo.continuum.io/pkgs/free/{}-64/{}-py36_0.tar.bz2'.format(base_platform,
+    f = 'http://repo.anaconda.com/pkgs/free/{}-64/{}-py36_0.tar.bz2'.format(base_platform,
                                                                             package_name)
     fn = "{}-py36_0.tar.bz2".format(package_name)
     download(f, fn)
@@ -89,7 +90,7 @@ def test_no_imports_found(testing_workdir, base_platform, package, capfd):
 def test_no_platform(testing_workdir, base_platform, package):
     package_name, example_file = package
 
-    f = 'http://repo.continuum.io/pkgs/free/{}-64/{}-py36_0.tar.bz2'.format(base_platform,
+    f = 'http://repo.anaconda.com/pkgs/free/{}-64/{}-py36_0.tar.bz2'.format(base_platform,
                                                                             package_name)
     fn = "{}-py36_0.tar.bz2".format(package_name)
     download(f, fn)
@@ -112,7 +113,7 @@ def test_c_extension_error(testing_workdir, base_platform, package):
         if platform == source_platform:
             platforms.remove(platform)
 
-    f = 'http://repo.continuum.io/pkgs/free/{}-64/{}-py36_0.tar.bz2'.format(base_platform,
+    f = 'http://repo.anaconda.com/pkgs/free/{}-64/{}-py36_0.tar.bz2'.format(base_platform,
                                                                             package_name)
     fn = "{}-py36_0.tar.bz2".format(package_name)
     download(f, fn)
@@ -137,7 +138,7 @@ def test_c_extension_conversion(testing_workdir, base_platform, package):
         if platform == source_platform:
             platforms.remove(platform)
 
-    f = 'http://repo.continuum.io/pkgs/free/{}-64/{}-py36_0.tar.bz2'.format(base_platform,
+    f = 'http://repo.anaconda.com/pkgs/free/{}-64/{}-py36_0.tar.bz2'.format(base_platform,
                                                                             package_name)
     fn = "{}-py36_0.tar.bz2".format(package_name)
     download(f, fn)
@@ -148,14 +149,13 @@ def test_c_extension_conversion(testing_workdir, base_platform, package):
         assert os.path.exists('{}/{}' .format(platform, fn))
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize('base_platform', ['linux', 'win', 'osx'])
 @pytest.mark.parametrize('package', [('itsdangerous-0.24', 'itsdangerous.py'),
                                      ('py-1.4.32', 'py/__init__.py')])
 def test_convert_platform_to_others(testing_workdir, base_platform, package):
     package_name, example_file = package
     subdir = '{}-64'.format(base_platform)
-    f = 'http://repo.continuum.io/pkgs/free/{}/{}-py27_0.tar.bz2'.format(subdir,
+    f = 'http://repo.anaconda.com/pkgs/free/{}/{}-py27_0.tar.bz2'.format(subdir,
                                                                          package_name)
     fn = "{}-py27_0.tar.bz2".format(package_name)
     download(f, fn)
@@ -173,7 +173,7 @@ def test_convert_platform_to_others(testing_workdir, base_platform, package):
                 assert_package_paths_matches_files(package)
 
 
-@pytest.mark.serial
+@pytest.mark.slow
 @pytest.mark.skipif(on_win, reason="we create the pkg to be converted in *nix; don't run on win.")
 def test_convert_from_unix_to_win_creates_entry_points(testing_config):
     recipe_dir = os.path.join(metadata_dir, "entry_points")
@@ -185,19 +185,30 @@ def test_convert_from_unix_to_win_creates_entry_points(testing_config):
         assert package_has_file(converted_fn, "Scripts/test-script-manual.exe")
         script_contents = package_has_file(converted_fn, "Scripts/test-script-setup-script.py")
         assert script_contents
-        assert "Test script setup" in script_contents.decode()
+        assert "Test script setup" in script_contents
         bat_contents = package_has_file(converted_fn, "Scripts/test-script-setup.exe")
         assert bat_contents
         assert_package_consistency(converted_fn)
-        paths_content = json.loads(package_has_file(converted_fn, 'info/paths.json').decode())
+        paths_content = json.loads(package_has_file(converted_fn, 'info/paths.json'))
+
+        # Check the validity of the sha and filesize of the converted scripts
+        with tarfile.open(converted_fn) as t:
+            for f in paths_content['paths']:
+                if f['_path'].startswith('Scripts/') and f['_path'].endswith('-script.py'):
+                    script_content = package_has_file(converted_fn, f['_path'])
+                    if hasattr(script_content, 'encode'):
+                        script_content = script_content.encode()
+                    assert f['sha256'] == hashlib.sha256(script_content).hexdigest()
+                    assert f['size_in_bytes'] == t.getmember(f['_path']).size
+
         paths_list = {f['_path'] for f in paths_content['paths']}
-        files = {p.decode() for p in package_has_file(converted_fn, 'info/files').splitlines()}
+        files = {p for p in package_has_file(converted_fn, 'info/files').splitlines()}
         assert files == paths_list
 
-        index = json.loads(package_has_file(converted_fn, 'info/index.json').decode())
+        index = json.loads(package_has_file(converted_fn, 'info/index.json'))
         assert index['subdir'] == platform
 
-        has_prefix_files = package_has_file(converted_fn, "info/has_prefix").decode()
+        has_prefix_files = package_has_file(converted_fn, "info/has_prefix")
         fieldnames = ['prefix', 'type', 'path']
         csv_dialect = csv.Sniffer().sniff(has_prefix_files)
         csv_dialect.lineterminator = '\n'
@@ -211,13 +222,12 @@ def test_convert_from_unix_to_win_creates_entry_points(testing_config):
         assert 'Scripts/test-script-manual-postfix-script.py' in has_prefix_files
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize('base_platform', ['linux', 'win', 'osx'])
 @pytest.mark.parametrize('package', [('anaconda-4.4.0', 'version.txt')])
 def test_convert_dependencies(testing_workdir, base_platform, package):
     package_name, example_file = package
     subdir = '{}-64'.format(base_platform)
-    f = 'http://repo.continuum.io/pkgs/free/{}/{}-np112py36_0.tar.bz2'.format(subdir,
+    f = 'http://repo.anaconda.com/pkgs/free/{}/{}-np112py36_0.tar.bz2'.format(subdir,
                                                                               package_name)
     fn = "{}-np112py36_0.tar.bz2".format(package_name)
     download(f, fn)
@@ -245,13 +255,12 @@ def test_convert_dependencies(testing_workdir, base_platform, package):
                 assert_package_paths_matches_files(package)
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize('base_platform', ['linux', 'win', 'osx'])
 @pytest.mark.parametrize('package', [('anaconda-4.4.0', 'version.txt')])
 def test_convert_no_dependencies(testing_workdir, base_platform, package):
     package_name, example_file = package
     subdir = '{}-64'.format(base_platform)
-    f = 'http://repo.continuum.io/pkgs/free/{}/{}-np112py36_0.tar.bz2'.format(subdir,
+    f = 'http://repo.anaconda.com/pkgs/free/{}/{}-np112py36_0.tar.bz2'.format(subdir,
                                                                               package_name)
     fn = "{}-np112py36_0.tar.bz2".format(package_name)
     download(f, fn)
@@ -276,14 +285,13 @@ def test_convert_no_dependencies(testing_workdir, base_platform, package):
                 assert_package_paths_matches_files(package)
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize('base_platform', ['linux', 'win', 'osx'])
 @pytest.mark.parametrize('package', [('anaconda-4.4.0', 'version.txt')])
 def test_skip_conversion(testing_workdir, base_platform, package, capfd):
     package_name, example_file = package
     source_plat_arch = '{}-64' .format(base_platform)
 
-    f = 'http://repo.continuum.io/pkgs/free/{}-64/{}-np112py36_0.tar.bz2'.format(base_platform,
+    f = 'http://repo.anaconda.com/pkgs/free/{}-64/{}-np112py36_0.tar.bz2'.format(base_platform,
                                                                             package_name)
     fn = "{}-np112py36_0.tar.bz2".format(package_name)
     download(f, fn)
@@ -300,3 +308,32 @@ def test_skip_conversion(testing_workdir, base_platform, package, capfd):
 
     assert skip_message in output
     assert not os.path.exists(package)
+
+
+@pytest.mark.parametrize('base_platform', ['linux', 'osx'])
+@pytest.mark.parametrize('package', [('sparkmagic-0.12.1', '')])
+def test_renaming_executables(testing_workdir, base_platform, package):
+    """Test that the files in /bin are properly renamed.
+
+    When converting the bin/ directory to Scripts/, only scripts
+    need to be changed. Sometimes the /bin directory contains other
+    files that are not Python scripts such as post-link.sh scripts.
+    This test converts a packaege that contains a post-link.sh script
+    in the bin/ directory and checks to see that its filename remains
+    the same.
+    """
+    package_name, example_file = package
+    subdir = '{}-64'.format(base_platform)
+    f = 'http://repo.anaconda.com/pkgs/free/{}/{}-py27_0.tar.bz2'.format(subdir,
+                                                                         package_name)
+    fn = "{}-py27_0.tar.bz2".format(package_name)
+    download(f, fn)
+    expected_paths_json = package_has_file(fn, 'info/paths.json')
+    api.convert(fn, platforms='all', quiet=False, verbose=False)
+    for platform in ['osx-64', 'win-64', 'win-32', 'linux-64', 'linux-32']:
+        if subdir != platform:
+            package = os.path.join(platform, fn)
+
+            if expected_paths_json:
+                assert package_has_file(package, 'info/paths.json')
+                assert_package_paths_matches_files(package)

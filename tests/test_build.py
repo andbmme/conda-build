@@ -5,7 +5,6 @@ and is more unit-test oriented.
 
 import json
 import os
-import subprocess
 import sys
 
 import pytest
@@ -13,7 +12,7 @@ import pytest
 from conda_build import build, api
 from conda_build.utils import on_win
 
-from .utils import metadata_dir, put_bad_conda_on_path, get_noarch_python_meta
+from .utils import metadata_dir, get_noarch_python_meta
 
 prefix_tests = {"normal": os.path.sep}
 if sys.platform == "win32":
@@ -45,28 +44,13 @@ def test_find_prefix_files(testing_workdir):
 def test_build_preserves_PATH(testing_workdir, testing_config):
     m = api.render(os.path.join(metadata_dir, 'source_git'), config=testing_config)[0][0]
     ref_path = os.environ['PATH']
-    build.build(m)
+    build.build(m, stats=None)
     assert os.environ['PATH'] == ref_path
 
 
 def test_sanitize_channel():
     test_url = 'https://conda.anaconda.org/t/ms-534991f2-4123-473a-b512-42025291b927/somechannel'
     assert build.sanitize_channel(test_url) == 'https://conda.anaconda.org/t/<TOKEN>/somechannel'
-
-
-def test_write_about_json_without_conda_on_path(testing_workdir, testing_metadata):
-    with put_bad_conda_on_path(testing_workdir):
-        # verify that the correct (bad) conda is the one we call
-        with pytest.raises(subprocess.CalledProcessError):
-            subprocess.check_output('conda -h', env=os.environ, shell=True)
-        build.write_about_json(testing_metadata)
-
-    output_file = os.path.join(testing_metadata.config.info_dir, 'about.json')
-    assert os.path.isfile(output_file)
-    with open(output_file) as f:
-        about = json.load(f)
-    assert 'conda_version' in about
-    assert 'conda_build_version' in about
 
 
 def test_get_short_path(testing_metadata):
@@ -143,6 +127,51 @@ def test_create_info_files_json(testing_workdir, testing_metadata):
 
 
 @pytest.mark.skipif(on_win and sys.version[:3] == "2.7",
+                    reason="os.symlink is not available so can't setup test")
+def test_create_info_files_json_symlinks(testing_workdir, testing_metadata):
+    info_dir = os.path.join(testing_workdir, "info")
+    os.mkdir(info_dir)
+    path_one = os.path.join(testing_workdir, "one")
+    path_two = os.path.join(testing_workdir, "two")
+    path_three = os.path.join(testing_workdir, "three")  # do not make this one
+    path_foo = os.path.join(testing_workdir, "foo")
+    path_two_symlink = os.path.join(testing_workdir, "two_sl")
+    symlink_to_nowhere = os.path.join(testing_workdir, "nowhere_sl")
+    open(path_one, "a").close()
+    open(path_two, "a").close()
+    open(path_foo, "a").close()
+    os.symlink(path_two, path_two_symlink)
+    os.symlink(path_three, symlink_to_nowhere)
+    files_with_prefix = [("prefix/path", "text", "foo")]
+    files = ["one", "two", "foo", "two_sl", "nowhere_sl"]
+
+    build.create_info_files_json_v1(testing_metadata, info_dir, testing_workdir, files,
+                                    files_with_prefix)
+    files_json_path = os.path.join(info_dir, "paths.json")
+    expected_output = {
+        "paths": [{"file_mode": "text", "path_type": "hardlink", "_path": "foo",
+                   "prefix_placeholder": "prefix/path",
+                   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                   "size_in_bytes": 0},
+                  {"path_type": "softlink", "_path": "nowhere_sl",
+                   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                   "size_in_bytes": 0},
+                  {"path_type": "hardlink", "_path": "one",
+                   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                   "size_in_bytes": 0},
+                  {"path_type": "hardlink", "_path": "two",
+                   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                   "size_in_bytes": 0},
+                  {"path_type": "softlink", "_path": "two_sl",
+                   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                   "size_in_bytes": 0}],
+        "paths_version": 1}
+    with open(files_json_path, "r") as files_json:
+        output = json.load(files_json)
+        assert output == expected_output
+
+
+@pytest.mark.skipif(on_win and sys.version[:3] == "2.7",
                     reason="os.link is not available so can't setup test")
 def test_create_info_files_json_no_inodes(testing_workdir, testing_metadata):
     info_dir = os.path.join(testing_workdir, "info")
@@ -179,3 +208,19 @@ def test_create_info_files_json_no_inodes(testing_workdir, testing_metadata):
     with open(files_json_path, "r") as files_json:
         output = json.load(files_json)
         assert output == expected_output
+
+
+def test_rewrite_output(testing_workdir, testing_config, capsys):
+    api.build(os.path.join(metadata_dir, "_rewrite_env"), config=testing_config)
+    captured = capsys.readouterr()
+    stdout = captured.out
+    if sys.platform == 'win32':
+        assert "PREFIX=%PREFIX%" in stdout
+        assert "LIBDIR=%PREFIX%\\lib" in stdout
+        assert "PWD=%SRC_DIR%" in stdout
+        assert "BUILD_PREFIX=%BUILD_PREFIX%" in stdout
+    else:
+        assert "PREFIX=$PREFIX" in stdout
+        assert "LIBDIR=$PREFIX/lib" in stdout
+        assert "PWD=$SRC_DIR" in stdout
+        assert "BUILD_PREFIX=$BUILD_PREFIX" in stdout

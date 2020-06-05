@@ -10,16 +10,18 @@ from conda_build.conda_interface import PY3
 from conda_build.metadata import MetaData
 from conda_build.utils import on_win
 
-thisdir = os.path.dirname(os.path.realpath(__file__))
-metadata_dir = os.path.join(thisdir, "test-recipes/metadata")
-subpackage_dir = os.path.join(thisdir, "test-recipes/split-packages")
-fail_dir = os.path.join(thisdir, "test-recipes/fail")
+
+def get_root_dir():
+    import conda_build
+    conda_build_dir = os.path.realpath(os.path.dirname(conda_build.__file__))
+    return os.path.abspath(os.path.join(conda_build_dir, ".."))
 
 
-if PY3:
-    FileNotFoundError = FileNotFoundError
-else:
-    FileNotFoundError = OSError
+thisdir = os.path.join(get_root_dir(), "tests")
+metadata_dir = os.path.join(thisdir, "test-recipes", "metadata")
+subpackage_dir = os.path.join(thisdir, "test-recipes", "split-packages")
+fail_dir = os.path.join(thisdir, "test-recipes", "fail")
+archive_dir = os.path.join(thisdir, "archives")
 
 
 def is_valid_dir(parent_dir, dirname):

@@ -28,8 +28,8 @@ def test_api_render():
 
 def test_api_output_yaml():
     argspec = getargspec(api.output_yaml)
-    assert argspec.args == ['metadata', 'file_path']
-    assert argspec.defaults == (None,)
+    assert argspec.args == ['metadata', 'file_path', 'suppress_outputs']
+    assert argspec.defaults == (None, False)
 
 
 def test_api_get_output_file_path():
@@ -47,14 +47,14 @@ def test_api_check():
 def test_api_build():
     argspec = getargspec(api.build)
     assert argspec.args == ['recipe_paths_or_metadata', 'post', 'need_source_download',
-                            'build_only', 'notest', 'config', 'variants']
-    assert argspec.defaults == (None, True, False, False, None, None)
+                            'build_only', 'notest', 'config', 'variants', 'stats']
+    assert argspec.defaults == (None, True, False, False, None, None, None)
 
 
 def test_api_test():
     argspec = getargspec(api.test)
-    assert argspec.args == ['recipedir_or_package_or_metadata', 'move_broken', 'config']
-    assert argspec.defaults == (True, None)
+    assert argspec.args == ['recipedir_or_package_or_metadata', 'move_broken', 'config', 'stats']
+    assert argspec.defaults == (True, None, None)
 
 
 def test_api_list_skeletons():
@@ -118,5 +118,7 @@ def test_api_create_metapackage():
 
 def test_api_update_index():
     argspec = getargspec(api.update_index)
-    assert argspec.args == ['dir_paths', 'config', 'force', 'check_md5', 'remove', 'channel_name']
-    assert argspec.defaults == (None, False, False, False, None)
+    assert argspec.args == ['dir_paths', 'config', 'force', 'check_md5', 'remove', 'channel_name', 'subdir',
+                            'threads', 'patch_generator', "verbose", "progress", "hotfix_source_repo",
+                            'current_index_versions']
+    assert argspec.defaults == (None, False, False, False, None, None, None, None, False, False, None, None)

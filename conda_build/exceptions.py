@@ -71,7 +71,7 @@ class DependencyNeedsBuildingError(CondaBuildException):
                     continue
                 pkg = line.lstrip('  - ').split(' -> ')[-1]
                 self.matchspecs.append(pkg)
-                pkg = pkg.strip().split(' ')[0]
+                pkg = pkg.strip().split(' ')[0].split('=')[0].split('[')[0]
                 self.packages.append(pkg)
         if not self.packages:
             raise RuntimeError("failed to parse packages from exception:"
@@ -88,3 +88,28 @@ class DependencyNeedsBuildingError(CondaBuildException):
 
 class RecipeError(CondaBuildException):
     pass
+
+
+class BuildLockError(CondaBuildException):
+    """ Raised when we failed to acquire a lock. """
+
+
+class OverLinkingError(RuntimeError):
+    def __init__(self, error, *args):
+        self.error = error
+        self.msg = "overlinking check failed \n%s" % (error)
+        super(OverLinkingError, self).__init__(self.msg)
+
+
+class OverDependingError(RuntimeError):
+    def __init__(self, error, *args):
+        self.error = error
+        self.msg = "overdepending check failed \n%s" % (error)
+        super(OverDependingError, self).__init__(self.msg)
+
+
+class RunPathError(RuntimeError):
+    def __init__(self, error, *args):
+        self.error = error
+        self.msg = "runpaths check failed \n%s" % (error)
+        super(RunPathError, self).__init__(self.msg)

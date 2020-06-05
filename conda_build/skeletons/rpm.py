@@ -37,73 +37,46 @@ package:
 source:
   - url: {rpmurl}
     {checksum_name}: {checksum}
+    no_hoist: true
     folder: binary
   - url: {srcrpmurl}
     folder: source
 
-{depends_build}
+build:
+  number: 2
+  noarch: generic
+  missing_dso_whitelist:
+    - '*'
 
-outputs:
-  - name: {packagename}
-    noarch: generic
-{depends_run}
-    about:
-      home: {home}
-      license: {license}
-      license_family: {license_family}
-      summary: {summary}
-      description: {description}
+{depends}
+
+about:
+  home: {home}
+  license: {license}
+  license_family: {license_family}
+  summary: {summary}
+  description: {description}
 """
 
-
-RPM2CPIO = """\
-#!/bin/sh
-
-# Based on:
-# https://www.redhat.com/archives/rpm-list/2003-June/msg00367.html
-# Modified to also support xz compression.
-
-pkg=$1
-if [ "$pkg" = "" -o ! -e "$pkg" ]; then
-    echo "no package supplied" 1>&2
-   exit 1
-fi
-
-leadsize=96
-o=`expr $leadsize + 8`
-set `od -j $o -N 8 -t u1 $pkg`
-il=`expr 256 \* \( 256 \* \( 256 \* $2 + $3 \) + $4 \) + $5`
-dl=`expr 256 \* \( 256 \* \( 256 \* $6 + $7 \) + $8 \) + $9`
-
-sigsize=`expr 8 + 16 \* $il + $dl`
-o=`expr $o + $sigsize + \( 8 - \( $sigsize \% 8 \) \) \% 8 + 8`
-set `od -j $o -N 8 -t u1 $pkg`
-il=`expr 256 \* \( 256 \* \( 256 \* $2 + $3 \) + $4 \) + $5`
-dl=`expr 256 \* \( 256 \* \( 256 \* $6 + $7 \) + $8 \) + $9`
-
-hdrsize=`expr 8 + 16 \* $il + $dl`
-o=`expr $o + $hdrsize`
-
-hdr=`dd if=$pkg ibs=$o skip=1 count=1 2>/dev/null | od -N 2 -t x1 -An`
-# macOS dd and Linux od give different results
-hdr="${hdr#"${hdr%%[![:space:]]*}"}"
-# remove trailing whitespace characters
-hdr="${hdr%"${hdr##*[![:space:]]}"}"
-if [[ "$hdr" == "1f 8b" ]] || [[ "$hdr" == "1f  8b" ]]; then
-  dd if=$pkg ibs=$o skip=1 2>/dev/null | gunzip
-else
-  dd if=$pkg ibs=$o skip=1 2>/dev/null | xz -d
-fi
-"""
 
 BUILDSH = """\
 #!/bin/bash
 
-RPM=$(find ${PWD}/binary -name "*.rpm")
-mkdir -p ${PREFIX}/{hostmachine}/sysroot
-pushd ${PREFIX}/{hostmachine}/sysroot > /dev/null 2>&1
-  "${RECIPE_DIR}"/rpm2cpio "${RPM}" | cpio -idmv
-popd > /dev/null 2>&1
+set -o errexit -o pipefail
+
+mkdir -p "${PREFIX}"/{hostmachine}/sysroot
+if [[ -d usr/lib ]]; then
+  if [[ ! -d lib ]]; then
+    ln -s usr/lib lib
+  fi
+fi
+if [[ -d usr/lib64 ]]; then
+  if [[ ! -d lib64 ]]; then
+    ln -s usr/lib64 lib64
+  fi
+fi
+pushd "${PREFIX}"/{hostmachine}/sysroot > /dev/null 2>&1
+cp -Rf "${SRC_DIR}"/binary/* .
 """
 
 
@@ -119,15 +92,31 @@ CDTs = dict({'centos5': {'dirname': 'centos5',
                          'checksummer': hashlib.sha1,
                          'checksummer_name': "sha1",
                          'macros': {}},
-            'centos6': {'dirname': 'centos6',
+             'centos6': {'dirname': 'centos6',
                          'short_name': 'cos6',
-                         'base_url': 'http://mirror.centos.org/centos/6.9/os/{base_architecture}/CentOS/',  # noqa
-                         'sbase_url': 'http://vault.centos.org/6.9/os/Source/SPackages/',
-                         'repomd_url': 'http://mirror.centos.org/centos/6.9/os/{base_architecture}/repodata/repomd.xml',  # noqa
+                         'base_url': 'http://mirror.centos.org/centos/6.10/os/{base_architecture}/CentOS/',  # noqa
+                         'sbase_url': 'http://vault.centos.org/6.10/os/Source/SPackages/',
+                         'repomd_url': 'http://mirror.centos.org/centos/6.10/os/{base_architecture}/repodata/repomd.xml',  # noqa
                          'host_machine': '{architecture}-conda_cos6-linux-gnu',
                          'host_subdir': 'linux-{bits}',
                          'fname_architecture': '{architecture}',
                          'rpm_filename_platform': 'el6.{architecture}',
+                         'checksummer': hashlib.sha256,
+                         'checksummer_name': "sha256",
+                         # Some macros are defined in /etc/rpm/macros.* but I cannot find where
+                         # these ones are defined. Also, rpm --eval "%{gdk_pixbuf_base_version}"
+                         # gives nothing nor does rpm --showrc | grep gdk
+                         'macros': {'pyver': '2.6.6',
+                                    'gdk_pixbuf_base_version': '2.24.1'}},
+             'centos7': {'dirname': 'centos7',
+                         'short_name': 'cos7',
+                         'base_url': 'http://mirror.centos.org/altarch/7/os/{base_architecture}/CentOS/',  # noqa
+                         'sbase_url': 'http://vault.centos.org/7.7.1908/os/Source/SPackages/',
+                         'repomd_url': 'http://mirror.centos.org/altarch/7/os/{base_architecture}/repodata/repomd.xml',  # noqa
+                         'host_machine': '{gnu_architecture}-conda_cos7-linux-gnu',
+                         'host_subdir': 'linux-ppc64le',
+                         'fname_architecture': '{architecture}',
+                         'rpm_filename_platform': 'el7.{architecture}',
                          'checksummer': hashlib.sha256,
                          'checksummer_name': "sha256",
                          # Some macros are defined in /etc/rpm/macros.* but I cannot find where
@@ -277,7 +266,7 @@ def dictify(r, root=True):
     return d
 
 
-def dictify_pickled(xml_file, dict_massager=None, cdt=None):
+def dictify_pickled(xml_file, src_cache, dict_massager=None, cdt=None):
     pickled = xml_file + '.p'
     if exists(pickled):
         return pickle.load(open(pickled, 'rb'))
@@ -290,7 +279,7 @@ def dictify_pickled(xml_file, dict_massager=None, cdt=None):
         root = ET.fromstring(xmlstring.encode('utf-8'))
         result = dictify(root)
         if dict_massager:
-            result = dict_massager(result, cdt)
+            result = dict_massager(result, src_cache, cdt)
         pickle.dump(result, open(pickled, 'wb'))
         return result
 
@@ -304,13 +293,13 @@ def get_repo_dict(repomd_url, data_type, dict_massager, cdt, src_cache):
         open_csum = child.findall("open-checksum")[0].text
         xml_file = join(src_cache, open_csum)
         try:
-            xml_file, xml_csum = cache_file(src_cache, xml_file, cdt['checksummer'])
+            xml_file, xml_csum = cache_file(src_cache, xml_file, None, cdt['checksummer'])
         except:
             csum = child.findall("checksum")[0].text
             location = child.findall("location")[0].attrib['href']
             xmlgz_file = dirname(dirname(repomd_url)) + '/' + location
             cached_path, cached_csum = cache_file(src_cache, xmlgz_file,
-                                                  csum, cdt['checksummer'])
+                                                  None, cdt['checksummer'])
             assert csum == cached_csum, "Checksum for {} does not match value in {}".format(
                 xmlgz_file, repomd_url)
             with gzip.open(cached_path, 'rb') as gz:
@@ -323,7 +312,7 @@ def get_repo_dict(repomd_url, data_type, dict_massager, cdt, src_cache):
                         xml.write(xml_content)
                 else:
                     print("ERROR: Checksum of uncompressed file {} does not match".format(xmlgz_file))  # noqa
-        return dictify_pickled(xml_file, dict_massager, cdt)
+        return dictify_pickled(xml_file, src_cache, dict_massager, cdt)
     return dict({})
 
 
@@ -345,7 +334,7 @@ def massage_primary_requires(requires, cdt):
     return requires
 
 
-def massage_primary(repo_primary, cdt):
+def massage_primary(repo_primary, src_cache, cdt):
     """
     Massages the result of dictify() into a less cumbersome form.
     In particular:
@@ -524,6 +513,7 @@ def write_conda_recipes(recursive, repo_primary, package, architectures,
                                                  src_cache)
 
     sn = cdt['short_name'] + '-' + arch
+    dependsstr = ""
     if len(depends):
         depends_specs = ["{}-{}-{} {}{}".format(depend['name'].lower().replace('+', 'x'),
                                                 cdt['short_name'], depend['arch'],
@@ -531,13 +521,10 @@ def write_conda_recipes(recursive, repo_primary, package, architectures,
                          for depend in depends]
         dependsstr_part = '\n'.join(['    - {}'.format(depends_spec)
                                      for depends_spec in depends_specs])
-        dependsstr_build = 'requirements:\n' \
-                           '  build:\n' + dependsstr_part + '\n'
-        dependsstr_run = '    requirements:\n' \
-                           '      run:\n    ' + '\n    '.join(dependsstr_part.split('\n')) + '\n'
-    else:
-        dependsstr_build = ''
-        dependsstr_run = ''
+        dependsstr_build = '  build:\n' + dependsstr_part + '\n'
+        dependsstr_host = '  host:\n' + dependsstr_part + '\n'
+        dependsstr_run = '  run:\n' + dependsstr_part
+        dependsstr = 'requirements:\n' + dependsstr_build + dependsstr_host + dependsstr_run
 
     package_l = package.lower().replace('+', 'x')
     package_cdt_name = package_l + '-' + sn
@@ -546,8 +533,7 @@ def write_conda_recipes(recursive, repo_primary, package, architectures,
               'packagename': package_cdt_name,
               'hostmachine': cdt['host_machine'],
               'hostsubdir': cdt['host_subdir'],
-              'depends_build': dependsstr_build,
-              'depends_run': dependsstr_run,
+              'depends': dependsstr,
               'rpmurl': rpm_url,
               'srcrpmurl': srpm_url,
               'home': entry['home'],
@@ -565,7 +551,8 @@ def write_conda_recipes(recursive, repo_primary, package, architectures,
               'PREFIX': '{PREFIX}',
               'RPM': '{RPM}',
               'PWD': '{PWD}',
-              'RECIPE_DIR': '{RECIPE_DIR}'})
+              'RECIPE_DIR': '{RECIPE_DIR}',
+              'SRC_DIR': '{SRC_DIR}'})
     odir = join(output_dir, package_cdt_name)
     try:
         makedirs(odir)
@@ -573,10 +560,6 @@ def write_conda_recipes(recursive, repo_primary, package, architectures,
         pass
     with open(join(odir, 'meta.yaml'), 'w') as f:
         f.write(RPM_META.format(**d))
-    rpm2cpio = join(odir, 'rpm2cpio')
-    with open(rpm2cpio, 'w') as f:
-        chmod(rpm2cpio, 0o755)
-        f.write(RPM2CPIO)
     buildsh = join(odir, 'build.sh')
     with open(buildsh, 'w') as f:
         chmod(buildsh, 0o755)
@@ -593,12 +576,21 @@ def write_conda_recipe(packages, distro, output_dir, architecture, recursive, ov
     cdt_name = distro
     bits = '32' if architecture in ('armv6', 'armv7a', 'i686', 'i386') else '64'
     base_architectures = dict({'i686': 'i386'})
+    # gnu_architectures are those recognized by the canonical config.sub / config.guess
+    # and crosstool-ng. They are returned from ${CC} -dumpmachine and are a part of the
+    # sysroot.
+    gnu_architectures = dict({'ppc64le': 'powerpc64le'})
     try:
         base_architecture = base_architectures[architecture]
     except:
         base_architecture = architecture
+    try:
+        gnu_architecture = gnu_architectures[architecture]
+    except:
+        gnu_architecture = architecture
     architecture_bits = dict({'architecture': architecture,
                               'base_architecture': base_architecture,
+                              'gnu_architecture': gnu_architecture,
                               'bits': bits})
     cdt = dict()
     for k, v in iteritems(CDTs[cdt_name]):

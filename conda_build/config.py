@@ -1,13 +1,13 @@
 '''
 Module to store conda build settings.
 '''
-from __future__ import absolute_import, division, print_function
+from __future__ import absolute_import, division, print_function, unicode_literals
 
 import copy
 from collections import namedtuple
 import math
 import os
-from os.path import abspath, expanduser, join
+from os.path import abspath, expanduser, join, expandvars
 import shutil
 import sys
 import time
@@ -15,7 +15,7 @@ import time
 from .conda_interface import root_dir, root_writable
 from .conda_interface import binstar_upload
 from .variants import get_default_variant
-from .conda_interface import cc_platform, cc_conda_build, subdir
+from .conda_interface import cc_platform, cc_conda_build, subdir, url_path
 
 from .utils import get_build_folders, rm_rf, get_logger, get_conda_operation_locks
 
@@ -28,12 +28,18 @@ on_win = (sys.platform == 'win32')
 conda_build = "conda-build"
 
 
+# Python2 silliness:
+def python2_fs_encode(strin):
+    return strin.decode(sys.getfilesystemencoding()) if hasattr(strin, 'decode') else strin
+
+
 def _ensure_dir(path):
     # this can fail in parallel operation, depending on timing.  Just try to make the dir,
     #    but don't bail if fail.
-    if not os.path.isdir(path):
+    encpath = python2_fs_encode(path)
+    if not os.path.isdir(encpath):
         try:
-            os.makedirs(path)
+            os.makedirs(encpath)
         except OSError:
             pass
 
@@ -54,7 +60,10 @@ SUBDIR_ALIASES = {
 
 
 Setting = namedtuple("ConfigSetting", "name, default")
-DEFAULTS = [Setting('activate', True),
+
+
+def _get_default_settings():
+    return [Setting('activate', True),
             Setting('anaconda_upload', binstar_upload),
             Setting('force_upload', True),
             Setting('channel_urls', []),
@@ -65,10 +74,11 @@ DEFAULTS = [Setting('activate', True),
             Setting('skip_existing', False),
             Setting('token', None),
             Setting('user', None),
+            Setting('labels', []),
             Setting('verbose', True),
 
             Setting('debug', False),
-            Setting('timeout', 90),
+            Setting('timeout', 900),
             Setting('set_build_id', True),
             Setting('disable_pip', False),
             Setting('_output_folder', None),
@@ -80,13 +90,49 @@ DEFAULTS = [Setting('activate', True),
             Setting('remove_work_dir', True),
             Setting('_host_platform', None),
             Setting('_host_arch', None),
+            Setting('test_run_post', False),
             Setting('filename_hashing', cc_conda_build.get('filename_hashing',
                                                            'true').lower() == 'true'),
             Setting('keep_old_work', False),
-            Setting('_src_cache_root', cc_conda_build.get('cache_dir')),
+            Setting('_src_cache_root', abspath(expanduser(expandvars(
+                cc_conda_build.get('cache_dir')))) if cc_conda_build.get('cache_dir') else None),
             Setting('copy_test_source_files', True),
 
+            # should rendering cut out any skipped metadata?
+            Setting('trim_skip', True),
+
+            # Use channeldata.json for run_export information during rendering.
+            # Falls back to downloading packages if False or channeldata does
+            # not exist for the channel.
+            Setting('use_channeldata', False),
+
+            # Disable the overlinking test for this package. This test checks that transitive DSOs
+            # are not referenced by DSOs in the package being built. When this happens something
+            # has gone wrong with:
+            # 1. Linker flags not being passed, or not working correctly:
+            #    (GNU ld: -as-needed, Apple ld64: -dead_strip_dylibs -no_implicit_dylibs)
+            # 2. A missing package in reqs/run (maybe that package is missing run_exports?)
+            # 3. A missing (or broken) CDT package in reqs/build or (on systems without CDTs)
+            # 4. .. a missing value in the hard-coded but metadata-augmentable library whitelist
+            # It is important that packages do not suffer from 2 because uninstalling that missing
+            # package leads to an inability to run this package.
+            #
+            # default to not erroring with overlinking for now.  We have specified in
+            #    cli/main_build.py that this default will switch in conda-build 4.0.
+            Setting('error_overlinking', cc_conda_build.get('error_overlinking',
+                                                           'false').lower() == 'true'),
+            Setting('enable_static', cc_conda_build.get('enable_static',
+                                                           'false').lower() == 'true'),
+            Setting('error_overdepending', cc_conda_build.get('error_overdepending',
+                                                              'false').lower() == 'true'),
+
+            Setting('no_rewrite_stdout_env', cc_conda_build.get('no_rewrite_stdout_env',
+                                                              'false').lower() == 'true'),
+
             Setting('index', None),
+            # support legacy recipes where only build is specified and expected to be the
+            #    folder that packaging is done on
+            Setting('build_is_host', False),
 
             # these are primarily for testing.  They override the native build platform/arch,
             #     which is useful in tests, but makes little sense on actual systems.
@@ -96,6 +142,9 @@ DEFAULTS = [Setting('activate', True),
 
             # variants
             Setting('variant_config_files', []),
+            # these files preclude usage of any system-wide or cwd config files.
+            #    Config files in recipes are still respected, and they override this file.
+            Setting('exclusive_config_files', []),
             Setting('ignore_system_variants', False),
             Setting('hash_length', 7),
 
@@ -116,23 +165,37 @@ DEFAULTS = [Setting('activate', True),
             Setting('config_file', None),
             Setting('repository', 'pypitest'),
 
-            # conda-verify is disabled by default.  This is because it was inoperable for a long
-            #     time, and thus needs to be opt-in not opt-out.
-            Setting('verify', False),
-            Setting('ignore_recipe_verify_scripts',
-                  cc_conda_build.get('ignore_recipe_verify_scripts', [])),
-            Setting('ignore_package_verify_scripts',
-                    cc_conda_build.get('ignore_package_verify_scripts', [])),
-            Setting('run_recipe_verify_scripts',
-                    cc_conda_build.get('run_package_verify_scripts', [])),
-            Setting('run_package_verify_scripts',
-                    cc_conda_build.get('run_package_verify_scripts', [])),
+            Setting('verify', True),
+            Setting('ignore_verify_codes',
+                    cc_conda_build.get('ignore_verify_codes', [])),
+            Setting('exit_on_verify_error',
+                    cc_conda_build.get('exit_on_verify_error', False)),
 
             # Recipes that have no host section, only build, should bypass the build/host line.
             # This is to make older recipes still work with cross-compiling.  True cross-compiling
             # involving compilers (not just python) will still require recipe modification to have
             # distinct host and build sections, but simple python stuff should work without.
-            Setting('build_prefix_override', False)
+            Setting('merge_build_host', False),
+            # this one is the state that can be set elsewhere, which affects how
+            #    the "build_prefix" works.  The one above is a setting.
+            Setting('_merge_build_host', False),
+
+            # path to output build statistics to
+            Setting('stats_file', None),
+
+            # extra deps to add to test env creation
+            Setting('extra_deps', []),
+
+            # customize this so pip doesn't look in places we don't want.  Per-build path by default.
+            Setting('_pip_cache_dir', None),
+
+            # set up compression algorithm used in new-style packages
+            Setting('compression_tuple', ('.tar.zst', 'zstd', 'zstd:compression-level=22')),
+
+            # this can be set to different values (currently only 2 means anything) to use package formats
+            Setting('conda_pkg_format', cc_conda_build.get('pkg_format', None)),
+
+            Setting('suppress_variables', False),
             ]
 
 
@@ -202,13 +265,13 @@ class Config(object):
             self._src_cache_root = os.path.abspath(os.path.normpath(
                 os.path.expanduser(source_cache)))
         if croot:
-            self._croot = os.path.abspath(os.path.normpath(croot))
+            self._croot = os.path.abspath(os.path.normpath(os.path.expanduser(croot)))
         else:
             # set default value (not actually None)
             self._croot = getattr(self, '_croot', None)
 
         # handle known values better than unknown (allow defaults)
-        for value in DEFAULTS:
+        for value in _get_default_settings():
             self._set_attribute_from_kwargs(kwargs, value.name, value.default)
 
         # dangle remaining keyword arguments as attributes on this class
@@ -224,9 +287,9 @@ class Config(object):
     @arch.setter
     def arch(self, value):
         log = get_logger(__name__)
-        log.warn("setting build arch.  This is only useful when pretending to be on another "
-                 "arch, such as for rendering necessary dependencies on a non-native arch."
-                 "  I trust that you know what you're doing.")
+        log.warn("Setting build arch. This is only useful when pretending to be on another "
+                 "arch, such as for rendering necessary dependencies on a non-native arch. "
+                 "I trust that you know what you're doing.")
         self._arch = str(value)
 
     @property
@@ -238,10 +301,10 @@ class Config(object):
     @platform.setter
     def platform(self, value):
         log = get_logger(__name__)
-        log.warn("setting build platform. This is only useful when "
-                "pretending to be on another " "another platform, such as "
-                "for rendering necessary dependencies on a non-native "
-                "platform. I trust that you know what you're doing.")
+        log.warn("Setting build platform. This is only useful when "
+                 "pretending to be on another platform, such as "
+                 "for rendering necessary dependencies on a non-native "
+                 "platform. I trust that you know what you're doing.")
         if value == 'noarch':
             raise ValueError("config platform should never be noarch.  Set host_platform instead.")
         self._platform = value
@@ -254,8 +317,11 @@ class Config(object):
 
     @property
     def host_arch(self):
-        return (self._host_arch or
-                self.variant.get('target_platform', self.build_subdir).split('-', 1)[1])
+        try:
+            variant_arch = self.variant.get('target_platform', self.build_subdir).split('-', 1)[1]
+        except IndexError:
+            variant_arch = 64
+        return self._host_arch or variant_arch
 
     @host_arch.setter
     def host_arch(self, value):
@@ -308,6 +374,23 @@ class Config(object):
         self._target_subdir = value
 
     @property
+    def exclusive_config_file(self):
+        if self.exclusive_config_files:
+            return self.exclusive_config_files[0]
+        return None
+
+    @exclusive_config_file.setter
+    def exclusive_config_file(self, value):
+        if len(self.exclusive_config_files) > 1:
+            raise ValueError(
+                'Cannot set singular exclusive_config_file '
+                'if multiple exclusive_config_files are present.')
+        if value is None:
+            self.exclusive_config_files = []
+        else:
+            self.exclusive_config_files = [value]
+
+    @property
     def src_cache_root(self):
         return self._src_cache_root if self._src_cache_root else self.croot
 
@@ -324,12 +407,12 @@ class Config(object):
             if _bld_root_env:
                 self._croot = abspath(expanduser(_bld_root_env))
             elif _bld_root_rc:
-                self._croot = abspath(expanduser(_bld_root_rc))
+                self._croot = abspath(expanduser(expandvars(_bld_root_rc)))
             elif root_writable:
                 self._croot = join(root_dir, 'conda-bld')
             else:
                 self._croot = abspath(expanduser('~/conda-bld'))
-        return self._croot
+        return python2_fs_encode(self._croot)
 
     @croot.setter
     def croot(self, croot):
@@ -406,8 +489,8 @@ class Config(object):
     def CONDA_R(self, value):
         self.variant['r_base'] = value
 
-    def _get_python(self, prefix):
-        if sys.platform == 'win32':
+    def _get_python(self, prefix, platform):
+        if platform.startswith('win') or (platform == "noarch" and sys.platform == "win32"):
             if os.path.isfile(os.path.join(prefix, 'python_d.exe')):
                 res = join(prefix, 'python_d.exe')
             else:
@@ -416,28 +499,41 @@ class Config(object):
             res = join(prefix, 'bin/python')
         return res
 
-    def _get_perl(self, prefix):
-        if sys.platform == 'win32':
+    def _get_perl(self, prefix, platform):
+        if platform.startswith('win'):
             res = join(prefix, 'Library', 'bin', 'perl.exe')
         else:
             res = join(prefix, 'bin/perl')
         return res
 
     # TODO: This is probably broken on Windows, but no one has a lua package on windows to test.
-    def _get_lua(self, prefix):
+    def _get_lua(self, prefix, platform):
         lua_ver = self.variant.get('lua', get_default_variant(self)['lua'])
         binary_name = "luajit" if (lua_ver and lua_ver[0] == "2") else "lua"
-        if sys.platform == 'win32':
+        if platform.startswith('win'):
             res = join(prefix, 'Library', 'bin', '{}.exe'.format(binary_name))
         else:
             res = join(prefix, 'bin/{}'.format(binary_name))
         return res
 
-    def _get_r(self, prefix):
-        if sys.platform == 'win32':
+    def _get_r(self, prefix, platform):
+        if platform.startswith('win') or (platform == "noarch" and sys.platform == 'win32'):
             res = join(prefix, 'Scripts', 'R.exe')
+            # MRO test:
+            if not os.path.exists(res):
+                res = join(prefix, 'bin', 'R.exe')
         else:
             res = join(prefix, 'bin', 'R')
+        return res
+
+    def _get_rscript(self, prefix, platform):
+        if platform.startswith('win'):
+            res = join(prefix, 'Scripts', 'Rscript.exe')
+            # MRO test:
+            if not os.path.exists(res):
+                res = join(prefix, 'bin', 'Rscript.exe')
+        else:
+            res = join(prefix, 'bin', 'Rscript')
         return res
 
     def compute_build_id(self, package_name, reset=False):
@@ -458,7 +554,9 @@ class Config(object):
                 # important: this is recomputing prefixes and determines where work folders are.
                 self._build_id = build_id
                 if old_dir:
-                    shutil.move(old_dir, self.work_dir)
+                    work_dir = self.work_dir
+                    rm_rf(work_dir)
+                    shutil.move(old_dir, work_dir)
 
     @property
     def build_id(self):
@@ -472,7 +570,7 @@ class Config(object):
         _build_id = _build_id.rstrip("/").rstrip("\\")
         assert not os.path.isabs(_build_id), ("build_id should not be an absolute path, "
                                               "to preserve croot during path joins")
-        self._build_id = _build_id
+        self._build_id = python2_fs_encode(_build_id)
 
     @property
     def prefix_length(self):
@@ -499,11 +597,10 @@ class Config(object):
         """The temporary folder where the build environment is created.  The build env contains
         libraries that may be linked, but only if the host env is not specified.  It is placed on
         PATH."""
-        if (self.host_subdir != self.build_subdir and self.host_subdir != 'noarch' and not
-                self.build_prefix_override):
-            prefix = join(self.build_folder, '_build_env')
-        else:
+        if self._merge_build_host:
             prefix = self.host_prefix
+        else:
+            prefix = join(self.build_folder, '_build_env')
         return prefix
 
     @property
@@ -530,31 +627,36 @@ class Config(object):
         """The temporary folder where the test environment is created"""
         if on_win or not self.long_test_prefix:
             return self._short_test_prefix
-        return self._long_prefix(self._short_test_prefix)
+        # Reduce the length of the prefix by 2 characters to check if the null
+        # byte padding causes issues
+        return self._long_prefix(self._short_test_prefix)[:-2]
 
     @property
     def build_python(self):
-        return self.python_bin(self.build_prefix)
+        return self.python_bin(self.build_prefix, self.platform)
 
     @property
     def host_python(self):
-        return self._get_python(self.host_prefix)
+        return self._get_python(self.host_prefix, self.host_platform)
 
     @property
     def test_python(self):
-        return self.python_bin(self.test_prefix)
+        return self.python_bin(self.test_prefix, self.host_platform)
 
-    def python_bin(self, prefix):
-        return self._get_python(prefix)
+    def python_bin(self, prefix, platform):
+        return self._get_python(prefix, platform)
 
-    def perl_bin(self, prefix):
-        return self._get_perl(prefix)
+    def perl_bin(self, prefix, platform):
+        return self._get_perl(prefix, platform)
 
-    def lua_bin(self, prefix):
-        return self._get_lua(prefix)
+    def lua_bin(self, prefix, platform):
+        return self._get_lua(prefix, platform)
 
-    def r_bin(self, prefix):
-        return self._get_r(prefix)
+    def r_bin(self, prefix, platform):
+        return self._get_r(prefix, platform)
+
+    def rscript_bin(self, prefix, platform):
+        return self._get_rscript(prefix, platform)
 
     @property
     def info_dir(self):
@@ -635,16 +737,30 @@ class Config(object):
         return path
 
     @property
+    def pip_cache_dir(self):
+        path = self._pip_cache_dir or join(self.build_folder, 'pip_cache')
+        _ensure_dir(path)
+        return path
+
+    @pip_cache_dir.setter
+    def pip_cache_dir(self, path):
+        self._pip_cache_dir = path
+
+    @property
     def test_dir(self):
         """The temporary folder where test files are copied to, and where tests start execution"""
         path = join(self.build_folder, 'test_tmp')
         _ensure_dir(path)
         return path
 
+    @property
+    def subdirs_same(self):
+        return self.host_subdir == self.build_subdir
+
     def clean(self, remove_folders=True):
         # build folder is the whole burrito containing envs and source folders
         #   It will only exist if we download source, or create a build or test environment
-        if remove_folders and not getattr(self, 'dirty'):
+        if remove_folders and not getattr(self, 'dirty') and not getattr(self, 'keep_old_work'):
             if self.build_id:
                 if os.path.isdir(self.build_folder):
                     rm_rf(self.build_folder)
@@ -656,11 +772,11 @@ class Config(object):
                 rm_rf(os.path.join(self.build_folder, 'prefix_files'))
         else:
             print("\nLeaving build/test directories:"
-                  "\n  Work:\t", self.work_dir,
-                  "\n  Test:\t", self.test_dir,
+                  "\n  Work:\n", self.work_dir,
+                  "\n  Test:\n", self.test_dir,
                   "\nLeaving build/test environments:"
-                  "\n  Test:\tsource activate ", self.test_prefix,
-                  "\n  Build:\tsource activate ", self.build_prefix,
+                  "\n  Test:\nsource activate ", self.test_prefix,
+                  "\n  Build:\nsource activate ", self.build_prefix,
                   "\n\n")
 
         for lock in get_conda_operation_locks(self.locking, self.bldpkgs_dirs):
@@ -684,7 +800,7 @@ class Config(object):
 
     def __exit__(self, e_type, e_value, traceback):
         if not getattr(self, 'dirty') and e_type is None and not getattr(self, 'keep_old_work'):
-            get_logger(__name__).info("--dirty flag and --keep-old-work not specified."
+            get_logger(__name__).info("--dirty flag and --keep-old-work not specified. "
                                         "Removing build/test folder after successful build/test.\n")
             self.clean()
         else:
@@ -704,6 +820,23 @@ def get_or_merge_config(config, variant=None, **kwargs):
     if variant:
         config.variant.update(variant)
     return config
+
+
+def get_channel_urls(args):
+    channel_urls = args.get('channel') or args.get('channels') or ()
+    final_channel_urls = []
+
+    for url in channel_urls:
+        # allow people to specify relative or absolute paths to local channels
+        #    These channels still must follow conda rules - they must have the
+        #    appropriate platform-specific subdir (e.g. win-64)
+        if os.path.isdir(url):
+            if not os.path.isabs(url):
+                url = os.path.normpath(os.path.abspath(os.path.join(os.getcwd(), url)))
+            url = url_path(url)
+        final_channel_urls.append(url)
+
+    return final_channel_urls
 
 
 # legacy exports for conda

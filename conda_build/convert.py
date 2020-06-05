@@ -11,14 +11,14 @@ Tools for converting conda packages
 import glob
 import json
 import hashlib
-import ntpath
-import posixpath
 import os
 import re
 import shutil
 import sys
 import tarfile
 import tempfile
+
+from conda_build.utils import filter_info_files, walk
 
 
 def retrieve_c_extensions(file_path, show_imports=False):
@@ -177,7 +177,7 @@ def update_index_file(temp_dir, target_platform, dependencies, verbose):
         index = json.load(file)
 
     platform, architecture = target_platform.split('-')
-    other_platforms = ['linux-ppc64le', 'linux-armv6l', 'linux-armv7l', 'linux-aarch64']
+    other_platforms = ['linux-ppc64', 'linux-ppc64le', 'linux-armv6l', 'linux-armv7l', 'linux-aarch64']
 
     if target_platform in other_platforms:
         source_architecture = architecture
@@ -226,11 +226,12 @@ def update_lib_path(path, target_platform, temp_dir=None):
     """
     if target_platform == 'win':
         python_version = retrieve_python_version(path)
-        renamed_lib_path = re.sub('\Alib', 'Lib', path).replace(python_version, '')
+        renamed_lib_path = re.sub(r'\Alib', 'Lib', path).replace(python_version, '')
 
     elif target_platform == 'unix':
         python_version = retrieve_python_version(temp_dir)
-        renamed_lib_path = re.sub('\ALib', os.path.join('lib', python_version), path)
+        lib_python_version = os.path.join('lib', python_version).replace('\\', '\\\\')
+        renamed_lib_path = re.sub(r'\ALib', lib_python_version, path.replace('\\', '\\\\'))
 
     return os.path.normpath(renamed_lib_path)
 
@@ -270,22 +271,23 @@ def update_lib_contents(lib_directory, temp_dir, target_platform, file_path):
         except IndexError:
             pass
 
-        os.rename(os.path.join(temp_dir, 'lib'), os.path.join(temp_dir, 'Lib'))
+        shutil.move(os.path.join(temp_dir, 'lib'), os.path.join(temp_dir, 'Lib'))
 
     elif target_platform == 'unix':
-        try:
-            for lib_file in glob.iglob('{}/**' .format(lib_directory)):
-                python_version = retrieve_python_version(file_path)
-                new_lib_file = re.sub('Lib', os.path.join('lib', python_version), lib_file)
-                os.renames(lib_file, new_lib_file)
+        dest_dir = os.path.join(temp_dir, 'lib')
+        shutil.move(os.path.join(temp_dir, 'Lib'), dest_dir)
+        for lib_file in glob.iglob('{}/**' .format(dest_dir)):
+            python_version = retrieve_python_version(file_path)
+            py_folder = os.path.join(dest_dir, python_version)
+            new_lib_file = os.path.join(py_folder, os.path.basename(lib_file))
+            try:
+                os.makedirs(py_folder)
+            except:
+                pass
+            shutil.move(lib_file, new_lib_file)
 
-            os.rename(ntpath.join(temp_dir, 'Lib'), posixpath.join(temp_dir, 'lib'))
 
-        except OSError:
-            pass
-
-
-def update_executable_path(file_path, target_platform):
+def update_executable_path(temp_dir, file_path, target_platform):
     """Update the name of the executable files found in the paths.json file.
 
     When converting from unix to windows, executables are renamed with a '-script.py'
@@ -297,14 +299,43 @@ def update_executable_path(file_path, target_platform):
     target_platform (str) -- the platform to target: 'unix' or 'win'
     """
     if target_platform == 'win':
-        renamed_path = os.path.splitext(re.sub('\Abin', 'Scripts', file_path))[0]
-        renamed_executable_path = '{}-script.py' .format(renamed_path)
+        if os.path.basename(file_path).startswith('.') or is_binary_file(temp_dir, file_path):
+            renamed_executable_path = re.sub(r'\Abin', 'Scripts', file_path)
+        else:
+            renamed_path = os.path.splitext(re.sub('\Abin', 'Scripts', file_path))[0]
+            renamed_executable_path = '{}-script.py' .format(renamed_path)
 
     elif target_platform == 'unix':
-        renamed_path = os.path.splitext(re.sub('\AScripts', 'bin', file_path))[0]
+        renamed_path = re.sub(r'\AScripts', 'bin', file_path)
         renamed_executable_path = renamed_path.replace('-script.py', '')
 
     return renamed_executable_path
+
+
+def update_executable_sha(package_directory, executable_path):
+    """Update the sha of executable scripts.
+
+    When moving from windows to linux, a shebang line is removed/added from
+    script files which requires to update the sha.
+
+    """
+    with open(os.path.join(package_directory, executable_path), 'rb') as script_file:
+        script_file_contents = script_file.read()
+        return hashlib.sha256(script_file_contents).hexdigest()
+
+
+def update_executable_size(temp_dir, executable):
+    """Update the size of the converted executable files.
+
+    Positional arguments:
+    temp_dir (str) -- the file path to the temporary directory containing the source
+        package's extracted contents
+    executable (str) -- the executable whose size to update including its file extension
+
+    Returns:
+    byte size (int) of the executable file
+    """
+    return os.path.getsize(os.path.join(temp_dir, executable))
 
 
 def add_new_windows_path(executable_directory, executable):
@@ -349,7 +380,11 @@ def update_paths_file(temp_dir, target_platform):
                     path['_path'] = update_lib_path(path['_path'], 'win')
 
                 elif path['_path'].startswith('bin'):
-                    path['_path'] = update_executable_path(path['_path'], 'win')
+                    path['_path'] = update_executable_path(temp_dir, path['_path'], 'win')
+                    path['sha256'] = update_executable_sha(temp_dir, path['_path'])
+                    path['size_in_bytes'] = update_executable_size(temp_dir, path['_path'])
+
+                path['_path'] = path['_path'].replace('\\', '/').replace('\\\\', '/')
 
             script_directory = os.path.join(temp_dir, 'Scripts')
             if os.path.isdir(script_directory):
@@ -363,7 +398,11 @@ def update_paths_file(temp_dir, target_platform):
                     path['_path'] = update_lib_path(path['_path'], 'unix', temp_dir)
 
                 elif path['_path'].startswith('Scripts'):
-                    path['_path'] = update_executable_path(path['_path'], 'unix')
+                    path['_path'] = update_executable_path(temp_dir, path['_path'], 'unix')
+                    path['sha256'] = update_executable_sha(temp_dir, path['_path'])
+                    path['size_in_bytes'] = update_executable_size(temp_dir, path['_path'])
+
+                path['_path'] = path['_path'].replace('\\', '/').replace('\\\\', '/')
 
                 if path['_path'].endswith(('.bat', '.exe')):
                     paths['paths'].remove(path)
@@ -521,17 +560,15 @@ def update_files_file(temp_dir, verbose):
     """
     files_file = os.path.join(temp_dir, 'info/files')
 
-    with open(files_file, 'w+') as files:
+    with open(files_file, 'w') as files:
         file_paths = []
-        for dirpath, dirnames, filenames in os.walk(temp_dir):
-            for filename in filenames:
-                package_file_path = os.path.join(
-                    dirpath, filename).replace(temp_dir, '').lstrip(os.sep)
-                if not package_file_path.startswith('info'):
-                    file_paths.append(package_file_path)
-
-                    if verbose:
-                        print('Updating {}' .format(package_file_path))
+        for dirpath, dirnames, filenames in walk(temp_dir):
+            relative_dir = os.path.relpath(dirpath, temp_dir)
+            filenames = [os.path.join(relative_dir, f) for f in filenames]
+            for filename in filter_info_files(filenames, ''):
+                file_paths.append(filename.replace('\\', '/').replace('\\\\', '/'))
+                if verbose:
+                    print('Updating {}' .format(filename))
 
         for file_path in sorted(file_paths):
             files.write(file_path + '\n')
@@ -555,11 +592,11 @@ def create_target_archive(file_path, temp_dir, platform, output_dir):
     destination = os.path.join(output_directory, os.path.basename(file_path))
 
     with tarfile.open(destination, 'w:bz2') as target:
-        for dirpath, dirnames, filenames in os.walk(temp_dir):
+        for dirpath, dirnames, filenames in walk(temp_dir):
+            relative_dir = os.path.relpath(dirpath, temp_dir)
+            filenames = [os.path.join(relative_dir, f) for f in filenames]
             for filename in filenames:
-                destination_file_path = os.path.join(
-                    dirpath, filename).replace(temp_dir, '').lstrip(os.sep)
-                target.add(os.path.join(dirpath, filename), arcname=destination_file_path)
+                target.add(os.path.join(temp_dir, filename), arcname=filename)
 
 
 def convert_between_unix_platforms(file_path, output_dir, platform, dependencies, verbose):
@@ -726,7 +763,7 @@ def conda_convert(file_path, output_dir=".", show_imports=False, platforms=None,
     source_platform_architecture = '{}-{}' .format(source_platform, architecture)
 
     if 'all' in platforms:
-        platforms = ['osx-64', 'linux-32', 'linux-64',
+        platforms = ['osx-64', 'linux-32', 'linux-64', 'linux-ppc64',
                      'linux-ppc64le', 'linux-armv6l', 'linux-armv7l', 'linux-aarch64',
                      'win-32', 'win-64']
 

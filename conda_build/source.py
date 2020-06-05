@@ -15,7 +15,7 @@ from .conda_interface import hashsum_file
 
 from conda_build.os_utils import external
 from conda_build.conda_interface import url_path, CondaHTTPError
-from conda_build.utils import (tar_xf, unzip, safe_print_unicode, copy_into, on_win, ensure_list,
+from conda_build.utils import (decompressible_exts, tar_xf, safe_print_unicode, copy_into, on_win, ensure_list,
                                check_output_env, check_call_env, convert_path_for_cygwin_or_msys2,
                                get_logger, rm_rf, LoggingContext)
 
@@ -36,13 +36,18 @@ def append_hash_to_fn(fn, hash_value):
     return ext_re.sub(r"\1_{}\2".format(hash_value[:10]), fn)
 
 
-def download_to_cache(cache_folder, recipe_path, source_dict):
+def download_to_cache(cache_folder, recipe_path, source_dict, verbose=False):
     ''' Download a source to the local cache. '''
-    print('Source cache directory is: %s' % cache_folder)
-    if not isdir(cache_folder):
+    log = get_logger(__name__)
+    if verbose:
+        log.info('Source cache directory is: %s' % cache_folder)
+    if not isdir(cache_folder) and not os.path.islink(cache_folder):
         os.makedirs(cache_folder)
 
-    unhashed_fn = fn = source_dict['fn'] if 'fn' in source_dict else basename(source_dict['url'])
+    source_urls = source_dict['url']
+    if not isinstance(source_urls, list):
+        source_urls = [source_urls]
+    unhashed_fn = fn = source_dict['fn'] if 'fn' in source_dict else basename(source_urls[0])
     hash_added = False
     for hash_type in ('md5', 'sha1', 'sha256'):
         if hash_type in source_dict:
@@ -50,18 +55,17 @@ def download_to_cache(cache_folder, recipe_path, source_dict):
             hash_added = True
             break
     else:
-        log = get_logger(__name__)
-        log.warn("No hash (md5, sha1, sha256) provided.  Source download forced.  "
-                 "Add hash to recipe to use source cache.")
+        log.warn("No hash (md5, sha1, sha256) provided for {}.  Source download forced.  "
+                 "Add hash to recipe to use source cache.".format(unhashed_fn))
     path = join(cache_folder, fn)
     if isfile(path):
-        print('Found source in cache: %s' % fn)
+        if verbose:
+            log.info('Found source in cache: %s' % fn)
     else:
-        print('Downloading source to cache: %s' % fn)
-        if not isinstance(source_dict['url'], list):
-            source_dict['url'] = [source_dict['url']]
+        if verbose:
+            log.info('Downloading source to cache: %s' % fn)
 
-        for url in source_dict['url']:
+        for url in source_urls:
             if "://" not in url:
                 if url.startswith('~'):
                     url = expanduser(url)
@@ -72,17 +76,19 @@ def download_to_cache(cache_folder, recipe_path, source_dict):
                 if url.startswith('file:///~'):
                     url = 'file:///' + expanduser(url[8:]).replace('\\', '/')
             try:
-                print("Downloading %s" % url)
+                if verbose:
+                    log.info("Downloading %s" % url)
                 with LoggingContext():
                     download(url, path)
             except CondaHTTPError as e:
-                print("Error: %s" % str(e).strip(), file=sys.stderr)
+                log.warn("Error: %s" % str(e).strip())
                 rm_rf(path)
             except RuntimeError as e:
-                print("Error: %s" % str(e).strip(), file=sys.stderr)
+                log.warn("Error: %s" % str(e).strip())
                 rm_rf(path)
             else:
-                print("Success")
+                if verbose:
+                    log.info("Success")
                 break
         else:  # no break
             rm_rf(path)
@@ -106,7 +112,7 @@ def download_to_cache(cache_folder, recipe_path, source_dict):
             hashed = hashsum_file(path, 'sha256')
         dest_path = append_hash_to_fn(path, hashed)
         if not os.path.isfile(dest_path):
-            os.rename(path, dest_path)
+            shutil.move(path, dest_path)
         path = dest_path
 
     return path, unhashed_fn
@@ -117,23 +123,20 @@ def hoist_single_extracted_folder(nested_folder):
 
     This is for when your archive extracts into its own folder, so that we don't need to
     know exactly what that folder is called."""
-    flist = os.listdir(nested_folder)
     parent = os.path.dirname(nested_folder)
-    nested_folders_to_remove = [nested_folder]
-    for thing in flist:
-        if not os.path.isdir(os.path.join(parent, thing)):
-            shutil.move(os.path.join(nested_folder, thing), os.path.join(parent, thing))
-        else:
-            copy_into(os.path.join(nested_folder, thing), os.path.join(parent, thing))
-            nested_folders_to_remove.append(os.path.join(nested_folder, thing))
-    for folder in nested_folders_to_remove:
-        rm_rf(folder)
+    flist = os.listdir(nested_folder)
+    with TemporaryDirectory() as tmpdir:
+        for entry in flist:
+            shutil.move(os.path.join(nested_folder, entry), os.path.join(tmpdir, entry))
+        rm_rf(nested_folder)
+        for entry in flist:
+            shutil.move(os.path.join(tmpdir, entry), os.path.join(parent, entry))
 
 
 def unpack(source_dict, src_dir, cache_folder, recipe_path, croot, verbose=False,
-           timeout=90, locking=True):
+           timeout=900, locking=True):
     ''' Uncompress a downloaded source. '''
-    src_path, unhashed_fn = download_to_cache(cache_folder, recipe_path, source_dict)
+    src_path, unhashed_fn = download_to_cache(cache_folder, recipe_path, source_dict, verbose)
 
     if not isdir(src_dir):
         os.makedirs(src_dir)
@@ -141,24 +144,22 @@ def unpack(source_dict, src_dir, cache_folder, recipe_path, croot, verbose=False
         print("Extracting download")
     with TemporaryDirectory(dir=croot) as tmpdir:
         unhashed_dest = os.path.join(tmpdir, unhashed_fn)
-        if src_path.lower().endswith(('.tar.gz', '.tar.bz2', '.tgz', '.tar.xz',
-                '.tar', 'tar.z')):
+        if src_path.lower().endswith(decompressible_exts):
             tar_xf(src_path, tmpdir)
-        elif src_path.lower().endswith('.zip'):
-            unzip(src_path, tmpdir)
-        elif src_path.lower().endswith('.whl'):
-            # copy wheel itself *and* unpack it
-            # This allows test_files or about.license_file to locate files in the wheel,
-            # as well as `pip install name-version.whl` as install command
-            unzip(src_path, tmpdir)
-            copy_into(src_path, unhashed_dest, timeout, locking=locking)
         else:
             # In this case, the build script will need to deal with unpacking the source
             print("Warning: Unrecognized source format. Source file will be copied to the SRC_DIR")
             copy_into(src_path, unhashed_dest, timeout, locking=locking)
+        if src_path.lower().endswith('.whl'):
+            # copy wheel itself *and* unpack it
+            # This allows test_files or about.license_file to locate files in the wheel,
+            # as well as `pip install name-version.whl` as install command
+            copy_into(src_path, unhashed_dest, timeout, locking=locking)
         flist = os.listdir(tmpdir)
         folder = os.path.join(tmpdir, flist[0])
-        if len(flist) == 1 and os.path.isdir(folder):
+        # Hoisting is destructive of information, in CDT packages, a single top level
+        # folder of /usr64 must not be discarded.
+        if len(flist) == 1 and os.path.isdir(folder) and 'no_hoist' not in source_dict:
             hoist_single_extracted_folder(folder)
         flist = os.listdir(tmpdir)
         for f in flist:
@@ -195,25 +196,39 @@ def git_mirror_checkout_recursive(git, mirror_dir, checkout_dir, git_url, git_ca
                  % (mirror_dir, git_cache))
 
     # This is necessary for Cygwin git and m2-git, although it is fixed in newer MSYS2.
-    git_mirror_dir = convert_path_for_cygwin_or_msys2(git, mirror_dir)
-    git_checkout_dir = convert_path_for_cygwin_or_msys2(git, checkout_dir)
+    git_mirror_dir = convert_path_for_cygwin_or_msys2(git, mirror_dir).rstrip('/')
+    git_checkout_dir = convert_path_for_cygwin_or_msys2(git, checkout_dir).rstrip('/')
 
+    # Set default here to catch empty dicts
+    git_ref = git_ref or 'HEAD'
+
+    mirror_dir = mirror_dir.rstrip('/')
     if not isdir(os.path.dirname(mirror_dir)):
         os.makedirs(os.path.dirname(mirror_dir))
     if isdir(mirror_dir):
-        if git_ref != 'HEAD':
-            check_call_env([git, 'fetch'], cwd=mirror_dir, stdout=stdout, stderr=stderr)
-        else:
-            # Unlike 'git clone', fetch doesn't automatically update the cache's HEAD,
-            # So here we explicitly store the remote HEAD in the cache's local refs/heads,
-            # and then explicitly set the cache's HEAD.
-            # This is important when the git repo is a local path like "git_url: ../",
-            # but the user is working with a branch other than 'master' without
-            # explicitly providing git_rev.
-            check_call_env([git, 'fetch', 'origin', '+HEAD:_conda_cache_origin_head'],
-                       cwd=mirror_dir, stdout=stdout, stderr=stderr)
-            check_call_env([git, 'symbolic-ref', 'HEAD', 'refs/heads/_conda_cache_origin_head'],
-                       cwd=mirror_dir, stdout=stdout, stderr=stderr)
+        try:
+            if git_ref != 'HEAD':
+                check_call_env([git, 'fetch'], cwd=mirror_dir, stdout=stdout, stderr=stderr)
+            else:
+                # Unlike 'git clone', fetch doesn't automatically update the cache's HEAD,
+                # So here we explicitly store the remote HEAD in the cache's local refs/heads,
+                # and then explicitly set the cache's HEAD.
+                # This is important when the git repo is a local path like "git_url: ../",
+                # but the user is working with a branch other than 'master' without
+                # explicitly providing git_rev.
+                check_call_env([git, 'fetch', 'origin', '+HEAD:_conda_cache_origin_head'],
+                           cwd=mirror_dir, stdout=stdout, stderr=stderr)
+                check_call_env([git, 'symbolic-ref', 'HEAD', 'refs/heads/_conda_cache_origin_head'],
+                           cwd=mirror_dir, stdout=stdout, stderr=stderr)
+        except CalledProcessError:
+            msg = ("Failed to update local git cache. "
+                   "Deleting local cached repo: {} ".format(mirror_dir))
+            print(msg)
+
+            # Maybe the failure was caused by a corrupt mirror directory.
+            # Delete it so the user can try again.
+            shutil.rmtree(mirror_dir)
+            raise
     else:
         args = [git, 'clone', '--mirror']
         if git_depth > 0:
@@ -289,12 +304,14 @@ def git_source(source_dict, git_cache, src_dir, recipe_path=None, verbose=True):
 
     git = external.find_executable('git')
     if not git:
-        sys.exit("Error: git is not installed in your root environment.")
+        sys.exit("Error: git is not installed in your root environment or as a build requirement.")
+
+    git_depth = int(source_dict.get('git_depth', -1))
+    git_ref = source_dict.get('git_rev') or 'HEAD'
 
     git_url = source_dict['git_url']
-    git_depth = int(source_dict.get('git_depth', -1))
-    git_ref = source_dict.get('git_rev', 'HEAD')
-
+    if git_url.startswith('~'):
+        git_url = os.path.expanduser(git_url)
     if git_url.startswith('.'):
         # It's a relative path from the conda recipe
         git_url = abspath(normpath(os.path.join(recipe_path, git_url)))
@@ -397,7 +414,7 @@ def hg_source(source_dict, src_dir, hg_cache, verbose):
     return src_dir
 
 
-def svn_source(source_dict, src_dir, svn_cache, verbose=True, timeout=90, locking=True):
+def svn_source(source_dict, src_dir, svn_cache, verbose=True, timeout=900, locking=True):
     ''' Download a source from SVN repo. '''
     if verbose:
         stdout = None
@@ -453,6 +470,7 @@ def get_repository_info(recipe_path):
             return "Origin {}, commit {}".format(origin, rev)
         elif isdir(join(recipe_path, ".svn")):
             info = check_output_env(["svn", "info"], cwd=recipe_path)
+            info = info.decode("utf-8")  # Py3 returns a byte string, but re needs unicode or str.
             server = re.search("Repository Root: (.*)$", info, flags=re.M).group(1)
             revision = re.search("Revision: (.*)$", info, flags=re.M).group(1)
             return "{}, Revision {}".format(server, revision)
@@ -514,14 +532,14 @@ def _guess_patch_strip_level(filesstr, src_dir):
 
 
 def _get_patch_file_details(path):
-    re_files = re.compile('^(?:---|\+\+\+) ([^\n\t]+)')
+    re_files = re.compile(r'^(?:---|\+\+\+) ([^\n\t]+)')
     files = set()
     with io.open(path, errors='ignore') as f:
         files = []
         first_line = True
         is_git_format = True
         for l in f.readlines():
-            if first_line and not re.match('From [0-9a-f]{40}', l):
+            if first_line and not re.match(r'From [0-9a-f]{40}', l):
                 is_git_format = False
             first_line = False
             m = re_files.search(l)
@@ -533,8 +551,74 @@ def _get_patch_file_details(path):
 
 
 def apply_patch(src_dir, path, config, git=None):
+    def patch_or_reverse(patch, patch_args, cwd, stdout, stderr):
+        # An old reference: https://unix.stackexchange.com/a/243748/34459
+        #
+        # I am worried that '--ignore-whitespace' may be destructive. If so we should
+        # avoid passing it, particularly in the initial (most likely to succeed) calls.
+        #
+        # From here-in I define a 'native' patch as one which has:
+        # 1. LF for the patch block metadata.
+        # 2. CRLF or LF for the actual patched lines matching those of the source lines.
+        #
+        # Calls to a raw 'patch' are destructive in various ways:
+        # 1. It leaves behind .rej and .orig files
+        # 2. If you pass it a patch with incorrect CRLF changes and do not pass --binary and
+        #    if any of those blocks *can* be applied, then the whole file gets written out with
+        #    LF.  This cannot be reversed either; the text changes will be reversed but not
+        #    line-feed changes (since all line-endings get changed, not just those of the of
+        #    patched lines)
+        # 3. If patching fails, the bits that succeeded remain, so patching is not at all
+        #    atomic.
+        #
+        # Still, we do our best to mitigate all of this as follows:
+        # 1. We disable .orig and .rej that for GNU patch via a temp file *
+        # 2 (1). We check for native application of a native patch (--binary, without --ignore-whitespace)
+        # 2 (2). We defer destructive calls to this until after the non-destructive ones.
+        # 3. When patch indicates failure, we call it with -R to reverse the damage.
+        #
+        # * Some may bemoan the loss of these, but they it is fairly random which patch and patch
+        #   attempt they apply to so their informational value is low, besides that, they are ugly.
+        #   (and destructive to the future patchability of the source tree).
+        #
+        import tempfile
+        temp_name = os.path.join(tempfile.gettempdir(), next(tempfile._get_candidate_names()))
+        patch_args.append('-r')
+        patch_args.append(temp_name)
+        patch_args = ['--no-backup-if-mismatch', '--batch'] + patch_args
+        log = get_logger(__name__)
+        try:
+            log.debug("Applying with\n{} {}".format(patch, patch_args))
+            check_call_env([patch] + patch_args, cwd=cwd, stdout=stdout, stderr=stderr)
+            # You can use this to pretend the patch failed so as to test reversal!
+            # raise CalledProcessError(-1, ' '.join([patch] + patch_args))
+        except Exception as e:
+            try:
+                if '--ignore-whitespace' in patch_args:
+                    patch_args.remove('--ignore-whitespace')
+                patch_args.insert(0, '-R')
+                patch_args.append('--binary')
+                patch_args.append('--force')
+                log.debug("Reversing with\n{} {}".format(patch, patch_args))
+                check_call_env([patch] + patch_args, cwd=cwd, stdout=stdout, stderr=stderr)
+            except:
+                pass
+            raise e
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
+
+    exception = None
     if not isfile(path):
         sys.exit('Error: no such patch: %s' % path)
+
+    if config.verbose:
+        stdout = None
+        stderr = None
+    else:
+        FNULL = open(os.devnull, 'w')
+        stdout = FNULL
+        stderr = FNULL
 
     files, is_git_format = _get_patch_file_details(path)
     if git and is_git_format:
@@ -547,12 +631,13 @@ def apply_patch(src_dir, path, config, git=None):
         git_env['GIT_COMMITTER_NAME'] = 'conda-build'
         git_env['GIT_COMMITTER_EMAIL'] = 'conda@conda-build.org'
         check_call_env([git, 'am', '--committer-date-is-author-date', path],
-                       cwd=src_dir, stdout=None, env=git_env)
+                       cwd=src_dir, stdout=stdout, stderr=stderr, env=git_env)
         config.git_commits_since_tag += 1
     else:
-        print('Applying patch: %r' % path)
+        if config.verbose:
+            print('Applying patch: %r' % path)
         patch = external.find_executable('patch', config.build_prefix)
-        if patch is None:
+        if patch is None or len(patch) == 0:
             sys.exit("""\
         Error:
             Cannot use 'git' (not a git repo and/or patch) and did not find 'patch' in: %s
@@ -560,41 +645,64 @@ def apply_patch(src_dir, path, config, git=None):
             or conda, m2-patch (Windows),
         """ % (os.pathsep.join(external.dir_paths)))
         patch_strip_level = _guess_patch_strip_level(files, src_dir)
-        patch_args = ['-p%d' % patch_strip_level, '-i', path]
-
-        # line endings are a pain.
-        # https://unix.stackexchange.com/a/243748/34459
+        path_args = ['-i', path]
+        patch_args = ['-p%d' % patch_strip_level]
 
         try:
             log = get_logger(__name__)
-            log.info("Trying to apply patch as-is")
-            check_call_env([patch] + patch_args, cwd=src_dir)
-        except CalledProcessError:
-            if sys.platform == 'win32':
+            # This is the case we check first of all as it is the case that allows a properly line-ended
+            # patch to apply correctly to a properly line-ended source tree, modifying it following the
+            # patch chunks exactly.
+            patch_or_reverse(patch, patch_args + ['--binary'] + path_args,
+                             cwd=src_dir, stdout=stdout, stderr=stderr)
+        except CalledProcessError as e:
+            # Capture the first exception
+            exception = e
+            if config.verbose:
+                log.info("Applying patch natively failed.  "
+                         "Trying to apply patch non-binary with --ignore-whitespace")
+            try:
+                patch_or_reverse(patch, patch_args + ['--ignore-whitespace'] + path_args,
+                                 cwd=src_dir, stdout=stdout, stderr=stderr)
+            except CalledProcessError as e:  # noqa
                 unix_ending_file = _ensure_unix_line_endings(path)
-                patch_args[-1] = unix_ending_file
+                path_args[-1] = unix_ending_file
                 try:
-                    log.info("Applying unmodified patch failed.  "
-                             "Convert to unix line endings and trying again.")
-                    check_call_env([patch] + patch_args, cwd=src_dir)
-                except:
-                    log.info("Applying unix patch failed.  "
-                             "Convert to CRLF line endings and trying again with --binary.")
-                    patch_args.insert(0, '--binary')
+                    if config.verbose:
+                        log.info("Applying natively *and* non-binary failed!  "
+                                "Converting to unix line endings and trying again.  "
+                                "WARNING :: This is destructive to the source file line-endings.")
+                    # If this succeeds, it will change the source files' CRLFs to LFs. This can
+                    # mess things up both for subsequent attempts (this line-ending change is not
+                    # reversible) but worse, for subsequent, correctly crafted (I'm calling these
+                    # "native" from now on) patches.
+                    patch_or_reverse(patch, patch_args + ['--ignore-whitespace'] + path_args,
+                                     cwd=src_dir, stdout=stdout, stderr=stderr)
+                except CalledProcessError:
+                    if config.verbose:
+                        log.warning("Applying natively, non-binary *and* unix attempts all failed!?  "
+                                    "Converting to CRLF line endings and trying again with "
+                                    "--ignore-whitespace and --binary. This can be destructive (even"
+                                    "with attempted reversal) to the source files' line-endings.")
                     win_ending_file = _ensure_win_line_endings(path)
-                    patch_args[-1] = win_ending_file
+                    path_args[-1] = win_ending_file
                     try:
-                        check_call_env([patch] + patch_args, cwd=src_dir)
+                        patch_or_reverse(patch, patch_args + ['--ignore-whitespace', '--binary'] + path_args,
+                                         cwd=src_dir, stdout=stdout, stderr=stderr)
                     except:
-                        raise
+                        pass
+                    else:
+                        exception = None
                     finally:
                         if os.path.exists(win_ending_file):
-                            os.remove(win_ending_file)  # clean up .patch_win file
+                            os.remove(win_ending_file)  # clean up .patch_unix file
+                else:
+                    exception = None
                 finally:
                     if os.path.exists(unix_ending_file):
-                        os.remove(unix_ending_file)  # clean up .patch_unix file
-            else:
-                raise
+                        os.remove(unix_ending_file)
+    if exception:
+        raise exception
 
 
 def provide(metadata):
@@ -617,8 +725,7 @@ def provide(metadata):
     try:
         for source_dict in dicts:
             folder = source_dict.get('folder')
-            src_dir = (os.path.join(metadata.config.work_dir, folder) if folder else
-                    metadata.config.work_dir)
+            src_dir = os.path.join(metadata.config.work_dir, folder if folder else '')
             if any(k in source_dict for k in ('fn', 'url')):
                 unpack(source_dict, src_dir, metadata.config.src_cache, recipe_path=metadata.path,
                     croot=metadata.config.croot, verbose=metadata.config.verbose,
@@ -637,13 +744,31 @@ def provide(metadata):
                         verbose=metadata.config.verbose, timeout=metadata.config.timeout,
                         locking=metadata.config.locking)
             elif 'path' in source_dict:
-                path = normpath(abspath(join(metadata.path, source_dict['path'])))
-                if metadata.config.verbose:
-                    print("Copying %s to %s" % (path, src_dir))
-                # careful here: we set test path to be outside of conda-build root in setup.cfg.
-                #    If you don't do that, this is a recursive function
-                copy_into(path, src_dir, metadata.config.timeout, symlinks=True,
-                        locking=metadata.config.locking, clobber=True)
+                source_path = os.path.expanduser(source_dict['path'])
+                path = normpath(abspath(join(metadata.path, source_path)))
+                path_via_symlink = 'path_via_symlink' in source_dict
+                if path_via_symlink and not folder:
+                    print("WARNING: `path_via_symlink` is too dangerous without specifying a folder,\n"
+                          "  conda could end up changing - or deleting - your local source code!\n"
+                          "  Going to make copies instead. When using `path_via_symlink` you should\n"
+                          "  also take care to run the build outside of your local source code folder(s)\n"
+                          "  unless that is your intention.")
+                    path_via_symlink = False
+                    sys.exit(1)
+                if path_via_symlink:
+                    src_dir_symlink = os.path.dirname(src_dir)
+                    if not isdir(src_dir_symlink):
+                        os.makedirs(src_dir_symlink)
+                    if metadata.config.verbose:
+                        print("Creating sybmolic link pointing to %s at %s" % (path, src_dir))
+                    os.symlink(path, src_dir)
+                else:
+                    if metadata.config.verbose:
+                        print("Copying %s to %s" % (path, src_dir))
+                    # careful here: we set test path to be outside of conda-build root in setup.cfg.
+                    #    If you don't do that, this is a recursive function
+                    copy_into(path, src_dir, metadata.config.timeout, symlinks=True,
+                            locking=metadata.config.locking, clobber=True)
             else:  # no source
                 if not isdir(src_dir):
                     os.makedirs(src_dir)
@@ -653,7 +778,7 @@ def provide(metadata):
                 apply_patch(src_dir, join(metadata.path, patch), metadata.config, git)
 
     except CalledProcessError:
-        os.rename(metadata.config.work_dir, metadata.config.work_dir + '_failed_provide')
+        shutil.move(metadata.config.work_dir, metadata.config.work_dir + '_failed_provide')
         raise
 
     return metadata.config.work_dir

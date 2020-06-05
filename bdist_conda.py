@@ -118,7 +118,8 @@ class CondaDistribution(Distribution):
 
 class bdist_conda(install):
     description = "create a conda package"
-    config = Config(build_id="bdist_conda" + "_" + str(int(time.time() * 1000)))
+    config = Config(build_id="bdist_conda" + "_" + str(int(time.time() * 1000)),
+                    build_is_host=True)
 
     def initialize_options(self):
         if not PY3:
@@ -133,7 +134,7 @@ class bdist_conda(install):
         opt_dict = self.distribution.get_option_dict('install')
         if self.prefix:
             raise DistutilsOptionError("--prefix is not allowed")
-        opt_dict['prefix'] = ("bdist_conda", self.config.build_prefix)
+        opt_dict['prefix'] = ("bdist_conda", self.config.host_prefix)
         if not PY3:
             # Command is an old-style class in Python 2
             install.finalize_options(self)
@@ -203,7 +204,12 @@ class bdist_conda(install):
                 c = configparser.ConfigParser()
                 entry_points = {}
                 try:
-                    c.readfp(StringIO(newstr))
+                    import six
+
+                    if six.PY2:
+                        c.readfp(StringIO(newstr))
+                    else:
+                        c.read_file(StringIO(newstr))
                 except Exception as err:
                     # This seems to be the best error here
                     raise DistutilsGetoptError("ERROR: entry-points not understood: " +

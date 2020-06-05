@@ -1,12 +1,13 @@
+import filelock
 import os
-import stat
+import subprocess
 import sys
-import unittest
-import zipfile
 
 import pytest
 
+from conda_build.exceptions import BuildLockError
 import conda_build.utils as utils
+from conda_build.utils import find_recipe
 
 
 def makefile(name, contents=""):
@@ -60,6 +61,7 @@ def namespace_setup(testing_workdir, request):
     return testing_workdir
 
 
+@pytest.mark.sanity
 def test_disallow_merge_conflicts(namespace_setup, testing_config):
     duplicate = os.path.join(namespace_setup, 'dupe', 'namespace', 'package', 'module.py')
     makefile(duplicate)
@@ -68,22 +70,7 @@ def test_disallow_merge_conflicts(namespace_setup, testing_config):
                                                  'package'))
 
 
-@pytest.mark.skipif(utils.on_win, reason="only unix has full os.chmod capabilities")
-def test_unzip(testing_workdir):
-    with open('file_with_execute_permission', 'w') as f:
-        f.write("test")
-    file_path = os.path.join(testing_workdir, 'file_with_execute_permission')
-    current_permissions = os.stat(file_path).st_mode
-    os.chmod(file_path, current_permissions | stat.S_IXUSR)
-    with zipfile.ZipFile('test.zip', 'w') as z:
-        z.write('file_with_execute_permission')
-    utils.unzip('test.zip', 'unpack')
-    unpacked_path = os.path.join('unpack', 'file_with_execute_permission')
-    assert os.path.isfile(unpacked_path)
-    st_mode = os.stat(unpacked_path).st_mode
-    assert st_mode & stat.S_IXUSR
-
-
+@pytest.mark.sanity
 def test_disallow_in_tree_merge(testing_workdir):
     with open('testfile', 'w') as f:
         f.write("test")
@@ -91,91 +78,95 @@ def test_disallow_in_tree_merge(testing_workdir):
         utils.merge_tree(testing_workdir, os.path.join(testing_workdir, 'subdir'))
 
 
-class TestUtils(unittest.TestCase):
+def test_relative_default():
+    for f, r in [
+            ('bin/python', '../lib'),
+            ('lib/libhdf5.so', '.'),
+            ('lib/python2.6/foobar.so', '..'),
+            ('lib/python2.6/lib-dynload/zlib.so', '../..'),
+            ('lib/python2.6/site-packages/pyodbc.so', '../..'),
+            ('lib/python2.6/site-packages/bsdiff4/core.so', '../../..'),
+            ('xyz', './lib'),
+            ('bin/somedir/cmd', '../../lib'),
+    ]:
+        assert utils.relative(f) == r
 
-    def test_relative_default(self):
-        for f, r in [
-                ('bin/python', '../lib'),
-                ('lib/libhdf5.so', '.'),
-                ('lib/python2.6/foobar.so', '..'),
-                ('lib/python2.6/lib-dynload/zlib.so', '../..'),
-                ('lib/python2.6/site-packages/pyodbc.so', '../..'),
-                ('lib/python2.6/site-packages/bsdiff4/core.so', '../../..'),
-                ('xyz', './lib'),
-                ('bin/somedir/cmd', '../../lib'),
-        ]:
-            self.assertEqual(utils.relative(f), r)
 
-    def test_relative_lib(self):
-        for f, r in [
-                ('bin/python', '../lib'),
-                ('lib/libhdf5.so', '.'),
-                ('lib/python2.6/foobar.so', '..'),
-                ('lib/python2.6/lib-dynload/zlib.so', '../..'),
-                ('lib/python2.6/site-packages/pyodbc.so', '../..'),
-                ('lib/python2.6/site-packages/bsdiff3/core.so', '../../..'),
-                ('xyz', './lib'),
-                ('bin/somedir/cmd', '../../lib'),
-                ('bin/somedir/somedir2/cmd', '../../../lib'),
-        ]:
-            self.assertEqual(utils.relative(f, 'lib'), r)
+def test_relative_lib():
+    for f, r in [
+            ('bin/python', '../lib'),
+            ('lib/libhdf5.so', '.'),
+            ('lib/python2.6/foobar.so', '..'),
+            ('lib/python2.6/lib-dynload/zlib.so', '../..'),
+            ('lib/python2.6/site-packages/pyodbc.so', '../..'),
+            ('lib/python2.6/site-packages/bsdiff3/core.so', '../../..'),
+            ('xyz', './lib'),
+            ('bin/somedir/cmd', '../../lib'),
+            ('bin/somedir/somedir2/cmd', '../../../lib'),
+    ]:
+        assert utils.relative(f, 'lib') == r
 
-    def test_relative_subdir(self):
-        for f, r in [
-                ('lib/libhdf5.so', './sub'),
-                ('lib/sub/libhdf5.so', '.'),
-                ('bin/python', '../lib/sub'),
-                ('bin/somedir/cmd', '../../lib/sub'),
-        ]:
-            self.assertEqual(utils.relative(f, 'lib/sub'), r)
 
-    def test_relative_prefix(self):
-        for f, r in [
-                ('xyz', '.'),
-                ('a/xyz', '..'),
-                ('a/b/xyz', '../..'),
-                ('a/b/c/xyz', '../../..'),
-                ('a/b/c/d/xyz', '../../../..'),
-        ]:
-            self.assertEqual(utils.relative(f, '.'), r)
+def test_relative_subdir():
+    for f, r in [
+            ('lib/libhdf5.so', './sub'),
+            ('lib/sub/libhdf5.so', '.'),
+            ('bin/python', '../lib/sub'),
+            ('bin/somedir/cmd', '../../lib/sub'),
+    ]:
+        assert utils.relative(f, 'lib/sub') == r
 
-    def test_relative_2(self):
-        for f, r in [
-                ('a/b/c/d/libhdf5.so', '../..'),
-                ('a/b/c/libhdf5.so', '..'),
-                ('a/b/libhdf5.so', '.'),
-                ('a/libhdf5.so', './b'),
-                ('x/x/libhdf5.so', '../../a/b'),
-                ('x/b/libhdf5.so', '../../a/b'),
-                ('x/libhdf5.so', '../a/b'),
-                ('libhdf5.so', './a/b'),
-        ]:
-            self.assertEqual(utils.relative(f, 'a/b'), r)
 
-    def test_relative_3(self):
-        for f, r in [
-                ('a/b/c/d/libhdf5.so', '..'),
-                ('a/b/c/libhdf5.so', '.'),
-                ('a/b/libhdf5.so', './c'),
-                ('a/libhdf5.so', './b/c'),
-                ('libhdf5.so', './a/b/c'),
-                ('a/b/x/libhdf5.so', '../c'),
-                ('a/x/x/libhdf5.so', '../../b/c'),
-                ('x/x/x/libhdf5.so', '../../../a/b/c'),
-                ('x/x/libhdf5.so', '../../a/b/c'),
-                ('x/libhdf5.so', '../a/b/c'),
-        ]:
-            self.assertEqual(utils.relative(f, 'a/b/c'), r)
+def test_relative_prefix():
+    for f, r in [
+            ('xyz', '.'),
+            ('a/xyz', '..'),
+            ('a/b/xyz', '../..'),
+            ('a/b/c/xyz', '../../..'),
+            ('a/b/c/d/xyz', '../../../..'),
+    ]:
+        assert utils.relative(f, '.') == r
 
-    def test_relative_4(self):
-        for f, r in [
-                ('a/b/c/d/libhdf5.so', '.'),
-                ('a/b/c/x/libhdf5.so', '../d'),
-                ('a/b/x/x/libhdf5.so', '../../c/d'),
-                ('a/x/x/x/libhdf5.so', '../../../b/c/d'),
-                ('x/x/x/x/libhdf5.so', '../../../../a/b/c/d'),
-        ]:
-            self.assertEqual(utils.relative(f, 'a/b/c/d'), r)
+
+def test_relative_2():
+    for f, r in [
+            ('a/b/c/d/libhdf5.so', '../..'),
+            ('a/b/c/libhdf5.so', '..'),
+            ('a/b/libhdf5.so', '.'),
+            ('a/libhdf5.so', './b'),
+            ('x/x/libhdf5.so', '../../a/b'),
+            ('x/b/libhdf5.so', '../../a/b'),
+            ('x/libhdf5.so', '../a/b'),
+            ('libhdf5.so', './a/b'),
+    ]:
+        assert utils.relative(f, 'a/b') == r
+
+
+def test_relative_3():
+    for f, r in [
+            ('a/b/c/d/libhdf5.so', '..'),
+            ('a/b/c/libhdf5.so', '.'),
+            ('a/b/libhdf5.so', './c'),
+            ('a/libhdf5.so', './b/c'),
+            ('libhdf5.so', './a/b/c'),
+            ('a/b/x/libhdf5.so', '../c'),
+            ('a/x/x/libhdf5.so', '../../b/c'),
+            ('x/x/x/libhdf5.so', '../../../a/b/c'),
+            ('x/x/libhdf5.so', '../../a/b/c'),
+            ('x/libhdf5.so', '../a/b/c'),
+    ]:
+        assert utils.relative(f, 'a/b/c') == r
+
+
+def test_relative_4():
+    for f, r in [
+            ('a/b/c/d/libhdf5.so', '.'),
+            ('a/b/c/x/libhdf5.so', '../d'),
+            ('a/b/x/x/libhdf5.so', '../../c/d'),
+            ('a/x/x/x/libhdf5.so', '../../../b/c/d'),
+            ('x/x/x/x/libhdf5.so', '../../../../a/b/c/d'),
+    ]:
+        assert utils.relative(f, 'a/b/c/d') == r
 
 
 def test_expand_globs(testing_workdir):
@@ -209,17 +200,22 @@ def test_expand_globs(testing_workdir):
 
 def test_filter_files():
     # Files that should be filtered out.
-    files_list = ['.git/a', 'something/.git/a', '.git\\a', 'something\\.git\\a']
+    files_list = ['.git/a', 'something/.git/a', '.git\\a', 'something\\.git\\a',
+                  'file.la', 'something/file.la', 'python.exe.conda_trash', 
+                  'bla.dll.conda_trash_1', 'bla.dll.conda_trash.conda_trash']
     assert not utils.filter_files(files_list, '')
 
     # Files that should *not* be filtered out.
     # Example of valid 'x.git' directory:
     #    lib/python3.4/site-packages/craftr/stl/craftr.utils.git/Craftrfile
     files_list = ['a', 'x.git/a', 'something/x.git/a',
-                  'x.git\\a', 'something\\x.git\\a']
+                  'x.git\\a', 'something\\x.git\\a', 'something/.gitmodules',
+                  'some/template/directory/.gitignore', 'another.lab',
+                  'miniconda_trashcan.py', 'conda_trash_avoider.py']
     assert len(utils.filter_files(files_list, '')) == len(files_list)
 
 
+@pytest.mark.serial
 def test_logger_filtering(caplog, capfd):
     import logging
     log = utils.get_logger(__name__, level=logging.DEBUG)
@@ -239,6 +235,8 @@ def test_logger_filtering(caplog, capfd):
     assert 'test warn message' in err
     assert 'test error message' in err
     assert caplog.text.count('duplicate') == 1
+    log.removeHandler(logging.StreamHandler(sys.stdout))
+    log.removeHandler(logging.StreamHandler(sys.stderr))
 
 
 def test_logger_config_from_file(testing_workdir, caplog, capfd, mocker):
@@ -297,3 +295,46 @@ def test_insert_variant_versions(testing_metadata):
     assert 'numpy 1.13' in testing_metadata.meta['requirements']['build']
     # the overall length does not change
     assert len(testing_metadata.meta['requirements']['build']) == 2
+
+
+def test_subprocess_stats_call(testing_workdir):
+    stats = {}
+    utils.check_call_env(['hostname'], stats=stats, cwd=testing_workdir)
+    assert stats
+    stats = {}
+    out = utils.check_output_env(['hostname'], stats=stats, cwd=testing_workdir)
+    assert out
+    assert stats
+    with pytest.raises(subprocess.CalledProcessError):
+        utils.check_call_env(['bash', '-c', 'exit 1'], cwd=testing_workdir)
+
+
+def test_try_acquire_locks(testing_workdir):
+    # Acquiring two unlocked locks should succeed.
+    lock1 = filelock.FileLock(os.path.join(testing_workdir, 'lock1'))
+    lock2 = filelock.FileLock(os.path.join(testing_workdir, 'lock2'))
+    with utils.try_acquire_locks([lock1, lock2], timeout=1):
+        pass
+
+    # Acquiring the same lock twice should fail.
+    lock1_copy = filelock.FileLock(os.path.join(testing_workdir, 'lock1'))
+    # Also verify that the error message contains the word "lock", since we rely
+    # on this elsewhere.
+    with pytest.raises(BuildLockError, match='Failed to acquire all locks'):
+        with utils.try_acquire_locks([lock1, lock1_copy], timeout=1):
+            pass
+
+def test_get_lock(testing_workdir):
+    lock1 = utils.get_lock(os.path.join(testing_workdir, 'lock1'))
+    lock2 = utils.get_lock(os.path.join(testing_workdir, 'lock2'))
+
+    # Different folders should get different lock files.
+    assert lock1.lock_file != lock2.lock_file
+
+    # Same folder should get the same lock file.
+    lock1_copy = utils.get_lock(os.path.join(testing_workdir, 'lock1'))
+    assert lock1.lock_file == lock1_copy.lock_file
+
+    # ...even when not normalized
+    lock1_unnormalized = utils.get_lock(os.path.join(testing_workdir, 'foo', '..', 'lock1'))
+    assert lock1.lock_file == lock1_unnormalized.lock_file

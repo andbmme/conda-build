@@ -4,6 +4,7 @@ import os.path
 
 from conda_build.os_utils.external import find_executable
 
+
 def test_find_executable(testing_workdir, monkeypatch):
     if sys.platform != "win32":
         import stat

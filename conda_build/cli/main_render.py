@@ -6,20 +6,41 @@
 
 from __future__ import absolute_import, division, print_function
 
+import argparse
 import logging
 import sys
-import os
+from pprint import pprint
 
-from conda_build.conda_interface import (ArgumentParser, add_parser_channels, cc_conda_build,
-                                         url_path)
+import yaml
+from yaml.parser import ParserError
+
+from conda_build.conda_interface import (ArgumentParser, add_parser_channels,
+                                         cc_conda_build)
 
 from conda_build import __version__, api
 
-from conda_build.config import get_or_merge_config
+from conda_build.config import get_or_merge_config, get_channel_urls
 from conda_build.variants import get_package_variants, set_language_env_vars
 from conda_build.utils import LoggingContext
 
 on_win = (sys.platform == 'win32')
+log = logging.getLogger(__name__)
+
+
+# see: https://stackoverflow.com/questions/29986185/python-argparse-dict-arg
+class ParseYAMLArgument(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        if len(values) != 1:
+            raise RuntimeError("This switch requires exactly one argument")
+
+        try:
+            my_dict = yaml.load(values[0], Loader=yaml.BaseLoader)
+            if not isinstance(my_dict, dict):
+                raise RuntimeError("The argument of {} is not a YAML dictionary.".format(option_string))
+
+            setattr(namespace, self.dest, my_dict)
+        except ParserError as e:
+            raise RuntimeError('The argument of {} is not a valid YAML. The parser error was: \n\n{}'.format(option_string, str(e)))
 
 
 def get_render_parser():
@@ -96,10 +117,18 @@ source to try fill in related template variables.",
     )
     p.add_argument(
         '-m', '--variant-config-files',
-        dest='variant_config_files',
         action="append",
         help="""Additional variant config files to add.  These yaml files can contain
         keys such as `c_compiler` and `target_platform` to form a build matrix."""
+    )
+    p.add_argument(
+        '-e', '--exclusive-config-files', '--exclusive-config-file',
+        action="append",
+        help="""Exclusive variant config files to add. Providing files here disables
+        searching in your home directory and in cwd.  The files specified here come at the
+        start of the order, as opposed to the end with --variant-config-files.  Any config
+        files in recipes and any config files specified with --variant-config-files will
+        override values from these files."""
     )
     p.add_argument(
         "--old-build-string", dest="filename_hashing", action="store_false",
@@ -109,7 +138,18 @@ source to try fill in related template variables.",
               "yours to handle. Any variants with overlapping names within a "
               "build will clobber each other.")
     )
-
+    p.add_argument(
+        '--use-channeldata',
+        action='store_true',
+        dest='use_channeldata',
+        help=("Use channeldata, if available, to determine run_exports. Otherwise packages "
+              "are downloaded to determine this information")
+    )
+    p.add_argument('--variants',
+                   nargs=1,
+                   action=ParseYAMLArgument,
+                   help=('Variants to extend the build matrix. Must be a valid YAML instance, '
+                         'such as "{python: [3.6, 3.7]}"'))
     add_parser_channels(p)
     return p
 
@@ -133,45 +173,55 @@ def parse_args(args):
         action='store_true',
         help='Enable verbose output from download tools and progress updates',
     )
-    args = p.parse_args(args)
+    args, _ = p.parse_known_args(args)
     return p, args
 
 
-def execute(args):
+def execute(args, print_results=True):
     p, args = parse_args(args)
 
     config = get_or_merge_config(None, **args.__dict__)
-    variants = get_package_variants(args.recipe, config)
+
+    variants = get_package_variants(args.recipe, config, variants=args.variants)
     set_language_env_vars(variants)
 
-    channel_urls = args.__dict__.get('channel') or args.__dict__.get('channels') or ()
-    config.channel_urls = []
-
-    for url in channel_urls:
-        # allow people to specify relative or absolute paths to local channels
-        #    These channels still must follow conda rules - they must have the
-        #    appropriate platform-specific subdir (e.g. win-64)
-        if os.path.isdir(url):
-            if not os.path.isabs(url):
-                url = os.path.normpath(os.path.abspath(os.path.join(os.getcwd(), url)))
-            url = url_path(url)
-        config.channel_urls.append(url)
+    config.channel_urls = get_channel_urls(args.__dict__)
 
     config.override_channels = args.override_channels
 
-    metadata_tuples = api.render(args.recipe, config=config,
-                                 no_download_source=args.no_source)
-
     if args.output:
-        with LoggingContext(logging.CRITICAL + 1):
-            config.verbose = False
-            config.debug = False
-            paths = api.get_output_file_paths(metadata_tuples, config=config)
-            print('\n'.join(sorted(paths)))
+        config.verbose = False
+        config.debug = False
+
+    metadata_tuples = api.render(args.recipe, config=config,
+                                 no_download_source=args.no_source,
+                                 variants=args.variants)
+
+    if args.file and len(metadata_tuples) > 1:
+        log.warning("Multiple variants rendered. "
+                    "Only one will be written to the file you specified ({}).".format(args.file))
+
+    if print_results:
+        if args.output:
+            with LoggingContext(logging.CRITICAL + 1):
+                paths = api.get_output_file_paths(metadata_tuples, config=config)
+                print('\n'.join(sorted(paths)))
+            if args.file:
+                m = metadata_tuples[-1][0]
+                api.output_yaml(m, args.file, suppress_outputs=True)
+        else:
+            logging.basicConfig(level=logging.INFO)
+            for (m, _, _) in metadata_tuples:
+                print("--------------")
+                print("Hash contents:")
+                print("--------------")
+                pprint(m.get_hash_contents())
+                print("----------")
+                print("meta.yaml:")
+                print("----------")
+                print(api.output_yaml(m, args.file, suppress_outputs=True))
     else:
-        logging.basicConfig(level=logging.INFO)
-        for (m, _, _) in metadata_tuples:
-            print(api.output_yaml(m, args.file))
+        return metadata_tuples
 
 
 def main():

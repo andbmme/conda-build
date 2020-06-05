@@ -1,22 +1,24 @@
 from __future__ import absolute_import, division, print_function
 
 import os
-import sys
+import pprint
 from os.path import isdir, join, dirname, isfile
 
 # importing setuptools patches distutils so that it knows how to find VC for python 2.7
 import setuptools  # noqa
 # Leverage the hard work done by setuptools/distutils to find vcvarsall using
 # either the registry or the VS**COMNTOOLS environment variable
-from distutils.msvc9compiler import find_vcvarsall as distutils_find_vcvarsall
-from distutils.msvc9compiler import Reg, WINSDK_BASE
+try:
+    from distutils.msvc9compiler import find_vcvarsall as distutils_find_vcvarsall
+    from distutils.msvc9compiler import Reg, WINSDK_BASE
+except:
+    # Allow some imports to work for cross or CONDA_SUBDIR usage.
+    pass
 
 from conda_build import environ
-from conda_build.utils import check_call_env, root_script_dir, path_prepended, copy_into, get_logger
+from conda_build.utils import (check_call_env, path_prepended,
+                               copy_into, get_logger, write_bat_activation_text)
 from conda_build.variants import set_language_env_vars, get_default_variant
-
-
-assert sys.platform == 'win32'
 
 
 VS_VERSION_STRING = {
@@ -89,6 +91,10 @@ def msvc_env_cmd(bits, config, override=None):
     log.warn("Using legacy MSVC compiler setup.  This will be removed in conda-build 4.0. "
              "If this recipe does not use a compiler, this message is safe to ignore.  "
              "Otherwise, use {{compiler('<language>')}} jinja2 in requirements/build.")
+    if override:
+        log.warn("msvc_compiler key in meta.yaml is deprecated. Use the new"
+        "variant-powered compiler configuration instead. Note that msvc_compiler"
+        "is incompatible with the new \{\{compiler('c')\}\} jinja scheme.")
     # this has been an int at times.  Make sure it's a string for consistency.
     bits = str(bits)
     arch_selector = 'x86' if bits == '32' else 'amd64'
@@ -201,11 +207,68 @@ def msvc_env_cmd(bits, config, override=None):
     return '\n'.join(msvc_env_lines) + '\n'
 
 
-def build(m, bld_bat):
-    with path_prepended(m.config.build_prefix):
-        with path_prepended(m.config.host_prefix):
-            env = environ.get_dict(config=m.config, m=m)
+def write_build_scripts(m, env, bld_bat):
+    env_script = join(m.config.work_dir, 'build_env_setup.bat')
+    if m.noarch == "python":
+        env["PYTHONDONTWRITEBYTECODE"] = True
+    import codecs
+    with codecs.getwriter('utf-8')(open(env_script, 'wb')) as fo:
+        # more debuggable with echo on
+        fo.write('@echo on\n')
+        for key, value in env.items():
+            if value != '' and value is not None:
+                fo.write('set "{key}={value}"\n'.format(key=key, value=value))
+        if not m.uses_new_style_compiler_activation:
+            fo.write(msvc_env_cmd(bits=m.config.host_arch, config=m.config,
+                                override=m.get_value('build/msvc_compiler', None)))
+        # Reset echo on, because MSVC scripts might have turned it off
+        fo.write('@echo on\n')
+        fo.write('set "INCLUDE={};%INCLUDE%"\n'.format(env["LIBRARY_INC"]))
+        fo.write('set "LIB={};%LIB%"\n'.format(env["LIBRARY_LIB"]))
+        if m.config.activate and m.name() != 'conda':
+            write_bat_activation_text(fo, m)
+    # bld_bat may have been generated elsewhere with contents of build/script
+    work_script = join(m.config.work_dir, 'conda_build.bat')
+    if os.path.isfile(bld_bat):
+        with open(bld_bat) as fi:
+            data = fi.read()
+        with codecs.getwriter('utf-8')(open(work_script, 'wb')) as fo:
+            fo.write('IF "%CONDA_BUILD%" == "" (\n')
+            fo.write("    call {}\n".format(env_script))
+            fo.write(')\n')
+            fo.write("REM ===== end generated header =====\n")
+            fo.write(data)
+    return work_script, env_script
+
+
+def build(m, bld_bat, stats, provision_only=False):
+    with path_prepended(m.config.host_prefix):
+        with path_prepended(m.config.build_prefix):
+            env = environ.get_dict(m=m)
     env["CONDA_BUILD_STATE"] = "BUILD"
+
+    # hard-code this because we never want pip's build isolation
+    #    https://github.com/conda/conda-build/pull/2972#discussion_r198290241
+    #
+    # Note that pip env "NO" variables are inverted logic.
+    #      PIP_NO_BUILD_ISOLATION=False means don't use build isolation.
+    #
+    env["PIP_NO_BUILD_ISOLATION"] = 'False'
+    # some other env vars to have pip ignore dependencies.
+    # we supply them ourselves instead.
+    #    See note above about inverted logic on "NO" variables
+    env["PIP_NO_DEPENDENCIES"] = True
+    env["PIP_IGNORE_INSTALLED"] = True
+
+    # pip's cache directory (PIP_NO_CACHE_DIR) should not be
+    # disabled as this results in .egg-info rather than
+    # .dist-info directories being created, see gh-3094
+    # set PIP_CACHE_DIR to a path in the work dir that does not exist.
+    env['PIP_CACHE_DIR'] = m.config.pip_cache_dir
+
+    # tell pip to not get anything from PyPI, please.  We have everything we need
+    # locally, and if we don't, it's a problem.
+    env["PIP_NO_INDEX"] = True
 
     # set variables like CONDA_PY in the test environment
     env.update(set_language_env_vars(m.config.variant))
@@ -215,57 +278,18 @@ def build(m, bld_bat):
         if not isdir(path):
             os.makedirs(path)
 
-    src_dir = m.config.work_dir
-    if os.path.isfile(bld_bat):
-        with open(bld_bat) as fi:
-            data = fi.read()
-        with open(join(src_dir, 'bld.bat'), 'w') as fo:
-            # more debuggable with echo on
-            fo.write('@echo on\n')
-            for key, value in env.items():
-                if value:
-                    fo.write('set "{key}={value}"\n'.format(key=key, value=value))
-            if not m.uses_new_style_compiler_activation:
-                fo.write(msvc_env_cmd(bits=m.config.host_arch, config=m.config,
-                                    override=m.get_value('build/msvc_compiler', None)))
-            # Reset echo on, because MSVC scripts might have turned it off
-            fo.write('@echo on\n')
-            fo.write('set "INCLUDE={};%INCLUDE%"\n'.format(env["LIBRARY_INC"]))
-            fo.write('set "LIB={};%LIB%"\n'.format(env["LIBRARY_LIB"]))
-            if m.config.activate and m.name() != 'conda':
-                fo.write('call "{conda_root}\\activate.bat" "{prefix}"\n'.format(
-                    conda_root=root_script_dir,
-                    prefix=m.config.build_prefix))
-                if m.is_cross:
-                    # HACK: we need both build and host envs "active" - i.e. on PATH,
-                    #     and with their activate.d scripts sourced. Conda only
-                    #     lets us activate one, though. This is a
-                    #     vile hack to trick conda into "stacking"
-                    #     two environments.
-                    #
-                    # Net effect: binaries come from host first, then build
-                    #
-                    # Conda 4.4 may break this by reworking the activate scripts.
-                    #  ^^ shouldn't be true
-                    # In conda 4.4, export CONDA_MAX_SHLVL=2 to stack envs to two
-                    #   levels deep.
-                    # conda 4.4 does require that a conda-meta/history file
-                    #   exists to identify a valid conda environment
-                    history_file = join(m.config.host_prefix, 'conda-meta', 'history')
-                    if not isfile(history_file):
-                        if not isdir(dirname(history_file)):
-                            os.makedirs(dirname(history_file))
-                        open(history_file, 'a').close()
-                    # removing this placeholder should make conda double-activate with conda 4.3
-                    fo.write('set "PATH=%PATH:CONDA_PATH_PLACEHOLDER;=%"\n')
-                    fo.write('set CONDA_MAX_SHLVL=2\n')
-                    fo.write('call "{conda_root}\\activate.bat" "{prefix}"\n'.format(
-                        conda_root=root_script_dir,
-                        prefix=m.config.host_prefix))
-            fo.write("REM ===== end generated header =====\n")
-            fo.write(data)
+    work_script, env_script = write_build_scripts(m, env, bld_bat)
 
-        cmd = ['cmd.exe', '/c', 'bld.bat']
-        check_call_env(cmd, cwd=src_dir)
-
-    fix_staged_scripts(join(m.config.host_prefix, 'Scripts'), config=m.config)
+    if not provision_only and os.path.isfile(work_script):
+        cmd = ['cmd.exe', '/d', '/c', os.path.basename(work_script)]
+        # rewrite long paths in stdout back to their env variables
+        if m.config.debug:
+            rewrite_env = None
+        else:
+            rewrite_env = {
+                k: env[k]
+                for k in ['PREFIX', 'BUILD_PREFIX', 'SRC_DIR'] if k in env
+            }
+            print("Rewriting env in output: %s" % pprint.pformat(rewrite_env))
+        check_call_env(cmd, cwd=m.config.work_dir, stats=stats, rewrite_stdout_env=rewrite_env)
+        fix_staged_scripts(join(m.config.host_prefix, 'Scripts'), config=m.config)

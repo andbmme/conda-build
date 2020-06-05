@@ -26,7 +26,11 @@ def rewrite_script(fn, prefix):
 
     # Load and check the source file for not being a binary
     src = join(prefix, 'Scripts' if ISWIN else 'bin', fn)
-    with io.open(src, encoding=locale.getpreferredencoding()) as fi:
+    encoding = locale.getpreferredencoding()
+    # if default locale is ascii, allow UTF-8 (a reasonably modern ASCII extension)
+    if encoding == "ANSI_X3.4-1968":
+        encoding = "UTF-8"
+    with io.open(src, encoding=encoding) as fi:
         try:
             data = fi.read()
         except UnicodeDecodeError:  # file is binary
@@ -57,13 +61,9 @@ def handle_file(f, d, prefix):
     if f.endswith(('.egg-info', '.pyc', '.pyo')):
         os.unlink(path)
 
-    # The presence of .so indicated this is not a noarch package
-    elif f.endswith(('.so', '.dll', '.pyd', '.exe', '.dylib')):
-        if f.endswith('.exe') and (isfile(os.path.join(prefix, f[:-4] + '-script.py')) or
-                                   basename(f[:-4]) in d['python-scripts']):
-            os.unlink(path)  # this is an entry point with a matching xx-script.py
-            return
-        _error_exit("Error: Binary library or executable found: %s" % f)
+    elif f.endswith('.exe') and (isfile(os.path.join(prefix, f[:-4] + '-script.py')) or
+                               basename(f[:-4]) in d['python-scripts']):
+        os.unlink(path)  # this is an entry point with a matching xx-script.py
 
     elif 'site-packages' in f:
         nsp = join(prefix, 'site-packages')
@@ -73,7 +73,7 @@ def handle_file(f, d, prefix):
         dst = join(prefix, g)
         dst_dir = dirname(dst)
         _force_dir(dst_dir)
-        os.rename(path, dst)
+        shutil.move(path, dst)
         d['site-packages'].append(g[14:])
 
     # Treat scripts specially with the logic from above
@@ -88,6 +88,7 @@ def handle_file(f, d, prefix):
     # No special treatment for other files
     # leave them as-is
     else:
+        # this should be the built-in logging module, not conda-build's stuff, because this file is standalone.
         log = logging.getLogger(__name__)
         log.debug("Don't know how to handle file: %s.  Including it as-is." % f)
 

@@ -1,10 +1,10 @@
 from __future__ import absolute_import, division, print_function
 
 import json
-from os.path import basename
+from os.path import basename, normpath
 import tarfile
 
-from conda_build.utils import codec
+from conda_build.utils import codec, filter_info_files
 
 
 def dist_fn(fn):
@@ -31,16 +31,16 @@ class TarCheck(object):
         self.t.close()
 
     def info_files(self):
-        lista = [p.strip().decode('utf-8') for p in
+        lista = [normpath(p.strip().decode('utf-8')) for p in
                  self.t.extractfile('info/files').readlines()]
         seta = set(lista)
         if len(lista) != len(seta):
             raise Exception('info/files: duplicates')
 
-        listb = [m.path for m in self.t.getmembers()
-                 if not (m.path.startswith('info/') or m.isdir())]
-        setb = set(listb)
-        if len(listb) != len(setb):
+        files_in_tar = [normpath(m.path) for m in self.t.getmembers()]
+        files_in_tar = filter_info_files(files_in_tar, '')
+        setb = set(files_in_tar)
+        if len(files_in_tar) != len(setb):
             raise Exception('info_files: duplicate members')
 
         if seta == setb:

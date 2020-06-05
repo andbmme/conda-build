@@ -39,9 +39,44 @@ def testing_workdir(tmpdir, request):
 
 
 @pytest.fixture(scope='function')
-def testing_config(testing_workdir, request):
+def testing_homedir(tmpdir, request):
+    """ Create a homedir in the users home directory; cd into dir above before test, cd out after
+
+    :param tmpdir: py.test fixture, will be injected
+    :param request: py.test fixture-related, will be injected (see pytest docs)
+    """
+
+    saved_path = os.getcwd()
+    d1 = os.path.basename(tmpdir)
+    d2 = os.path.basename(os.path.dirname(tmpdir))
+    d3 = os.path.basename(os.path.dirname(os.path.dirname(tmpdir)))
+    new_dir = os.path.join(os.path.expanduser('~'), d1, d2, d3, 'pytest.conda-build')
+    # While pytest will make sure a folder in unique
+    if os.path.exists(new_dir):
+        import shutil
+        try:
+            shutil.rmtree(new_dir)
+        except:
+            pass
+    try:
+        os.makedirs(new_dir)
+    except:
+        print("Failed to create {}".format(new_dir))
+        return None
+    os.chdir(new_dir)
+
+    def return_to_saved_path():
+        os.chdir(saved_path)
+
+    request.addfinalizer(return_to_saved_path)
+
+    return str(new_dir)
+
+
+@pytest.fixture(scope='function')
+def testing_config(testing_workdir):
     return Config(croot=testing_workdir, anaconda_upload=False, verbose=True,
-                  activate=False, debug=False, variant=None)
+                  activate=False, debug=False, variant=None, test_run_post=False)
 
 
 @pytest.fixture(scope='function')
@@ -51,13 +86,16 @@ def testing_metadata(request, testing_config):
     d['package']['version'] = '1.0'
     d['build']['number'] = '1'
     d['build']['entry_points'] = []
-    d['requirements']['build'] = ['python']
-    d['requirements']['run'] = ['python']
+    d['requirements']['build'] = []
+    d['requirements']['run'] = []
     d['test']['commands'] = ['echo "A-OK"', 'exit 0']
     d['about']['home'] = "sweet home"
     d['about']['license'] = "contract in blood"
     d['about']['summary'] = "a test package"
+    d['about']['tags'] = ['a', 'b']
+    d['about']['identifiers'] = 'a'
     testing_config.variant = get_default_variant(testing_config)
+    testing_config.variants = [testing_config.variant]
     return MetaData.fromdict(d, config=testing_config)
 
 
@@ -72,10 +110,6 @@ def testing_env(testing_workdir, request, monkeypatch):
     # cleanup is done by just cleaning up the testing_workdir
     return env_path
 
-
-# @pytest.fixture(scope='session')
-# def testing_example_package(tmpdir, testing_metadata):
-#     return api.build(testing_metadata)
 
 # these are functions so that they get regenerated each time we use them.
 #    They could be fixtures, I guess.

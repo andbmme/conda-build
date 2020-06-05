@@ -4,14 +4,11 @@ Module to handle generating test files.
 
 from __future__ import absolute_import, division, print_function
 
-import glob
-import logging
 import os
-from os.path import join, exists, isdir
-import sys
+from os.path import join, exists
+import json
 
-from conda_build.utils import copy_into, get_ext_files, on_win, ensure_list, rm_rf
-from conda_build import source
+from conda_build.utils import copy_into, ensure_list, glob, on_win, rm_rf
 
 
 def create_files(m, test_dir=None):
@@ -25,111 +22,105 @@ def create_files(m, test_dir=None):
     if not test_dir:
         test_dir = m.config.test_dir
     has_files = False
-    rm_rf(test_dir)
     if not os.path.isdir(test_dir):
         os.makedirs(test_dir)
-    for fn in ensure_list(m.get_value('test/files', [])):
+
+    for pattern in ensure_list(m.get_value('test/files', [])):
         has_files = True
-        path = join(m.path, fn)
-        # disable locking to avoid locking a temporary directory (the extracted test folder)
-        copy_into(path, join(test_dir, fn), m.config.timeout, locking=False,
-                  clobber=True)
-    # need to re-download source in order to do tests
-    if m.get_value('test/source_files') and not isdir(m.config.work_dir):
-        source.provide(m)
-    for pattern in ensure_list(m.get_value('test/source_files', [])):
-        if on_win and '\\' in pattern:
-            raise RuntimeError("test/source_files paths must use / "
-                                "as the path delimiter on Windows")
-        has_files = True
-        files = glob.glob(join(m.config.work_dir, pattern))
-        if not files:
-            raise RuntimeError("Did not find any source_files for test with pattern %s", pattern)
+        files = glob(join(m.path, pattern.replace('/', os.sep)))
         for f in files:
-            try:
-                # disable locking to avoid locking a temporary directory (the extracted test folder)
-                copy_into(f, f.replace(m.config.work_dir, test_dir), m.config.timeout,
-                          locking=False)
-            except OSError as e:
-                log = logging.getLogger(__name__)
-                log.warn("Failed to copy {0} into test files.  Error was: {1}".format(f, str(e)))
-        for ext in '.pyc', '.pyo':
-            for f in get_ext_files(test_dir, ext):
-                os.remove(f)
+            copy_into(f, f.replace(m.path, test_dir), m.config.timeout, locking=False,
+                    clobber=True)
     return has_files
+
+
+def _get_output_script_name(m, win_status):
+    # the way this works is that each output needs to explicitly define a test script to run.
+    #   They do not automatically pick up run_test.*, but can be pointed at that explicitly.
+
+    ext = '.bat' if win_status else '.sh'
+    dst_name = 'run_test' + ext
+    src_name = dst_name
+    if m.is_output:
+        src_name = 'no-file'
+        for out in m.meta.get('outputs', []):
+            if m.name() == out.get('name'):
+                out_test_script = out.get('test', {}).get('script', 'no-file')
+                if os.path.splitext(out_test_script)[1].lower() == ext:
+                    src_name = out_test_script
+                    break
+    return src_name, dst_name
 
 
 def create_shell_files(m, test_dir=None):
     if not test_dir:
         test_dir = m.config.test_dir
-    has_tests = False
-    ext = '.bat' if sys.platform == 'win32' else '.sh'
-    name = 'no-file'
 
-    # the way this works is that each output needs to explicitly define a test script to run.
-    #   They do not automatically pick up run_test.*, but can be pointed at that explicitly.
-    for out in m.meta.get('outputs', []):
-        if m.name() == out.get('name'):
-            out_test_script = out.get('test', {}).get('script', 'no-file')
-            if os.path.splitext(out_test_script)[1].lower() == ext:
-                name = out_test_script
-                break
-    else:
-        name = "run_test{}".format(ext)
+    win_status = [on_win]
 
-    if exists(join(m.path, name)):
-        # disable locking to avoid locking a temporary directory (the extracted test folder)
-        copy_into(join(m.path, name), test_dir, m.config.timeout, locking=False)
-        has_tests = True
+    if m.noarch:
+        win_status = [False, True]
 
-    commands = ensure_list(m.get_value('test/commands', []))
-    if commands:
-        with open(join(test_dir, name), 'a') as f:
-            f.write('\n\n')
-            if not on_win:
-                f.write('set -ex\n\n')
-            f.write('\n\n')
-            for cmd in commands:
-                f.write(cmd)
-                f.write('\n')
-                if on_win:
-                    f.write("IF %ERRORLEVEL% NEQ 0 exit 1\n")
-                has_tests = True
-            f.write('exit 0\n')
-
-    return has_tests
+    shell_files = []
+    for status in win_status:
+        src_name, dst_name = _get_output_script_name(m, status)
+        dest_file = join(test_dir, dst_name)
+        if exists(join(m.path, src_name)):
+            # disable locking to avoid locking a temporary directory (the extracted test folder)
+            copy_into(join(m.path, src_name), dest_file, m.config.timeout, locking=False)
+        if os.path.basename(test_dir) != 'test_tmp':
+            commands = ensure_list(m.get_value('test/commands', []))
+            if commands:
+                with open(join(dest_file), 'a') as f:
+                    f.write('\n\n')
+                    if not status:
+                        f.write('set -ex\n\n')
+                    f.write('\n\n')
+                    for cmd in commands:
+                        f.write(cmd)
+                        f.write('\n')
+                        if status:
+                            f.write("IF %ERRORLEVEL% NEQ 0 exit /B 1\n")
+                    if status:
+                        f.write('exit /B 0\n')
+                    else:
+                        f.write('exit 0\n')
+        if os.path.isfile(dest_file):
+            shell_files.append(dest_file)
+    return shell_files
 
 
 def _create_test_files(m, test_dir, ext, comment_char='# '):
-    # the way this works is that each output needs to explicitly define a test script to run
-    #   They do not automatically pick up run_test.*, but can be pointed at that explicitly.
     name = 'run_test' + ext
-    for out in m.meta.get('outputs', []):
-        if m.name() == out.get('name'):
-            out_test_script = out.get('test', {}).get('script', 'no-file')
-            if out_test_script.endswith(ext):
-                name = out_test_script
-                break
+    if m.is_output:
+        name = ''
+        # the way this works is that each output needs to explicitly define a test script to run
+        #   They do not automatically pick up run_test.*, but can be pointed at that explicitly.
+        for out in m.meta.get('outputs', []):
+            if m.name() == out.get('name'):
+                out_test_script = out.get('test', {}).get('script', 'no-file')
+                if out_test_script.endswith(ext):
+                    name = out_test_script
+                    break
 
-    test_file = os.path.join(m.path, name)
     out_file = join(test_dir, 'run_test' + ext)
+    if name:
+        test_file = os.path.join(m.path, name)
+        if os.path.isfile(test_file):
+            with open(out_file, 'w') as fo:
+                fo.write("%s tests for %s (this is a generated file);\n" % (comment_char, m.dist()))
+                fo.write("print('===== testing package: %s =====');\n" % m.dist())
 
-    if os.path.isfile(test_file):
-        with open(out_file, 'w') as fo:
-            fo.write("%s tests for %s (this is a generated file);\n" % (comment_char, m.dist()))
-            fo.write("print('===== testing package: %s =====');\n" % m.dist())
-
-            try:
-                with open(test_file) as fi:
-                    fo.write("print('running {0}');\n".format(name))
-                    fo.write("{0} --- {1} (begin) ---\n".format(comment_char, name))
-                    fo.write(fi.read())
-                    fo.write("{0} --- {1} (end) ---\n".format(comment_char, name))
-            except AttributeError:
-                fo.write("# tests were not packaged with this module, and cannot be run\n")
-            fo.write("\nprint('===== %s OK =====');\n" % m.dist())
-
-    return (out_file, os.path.isfile(test_file) and os.path.basename(test_file) != 'no-file')
+                try:
+                    with open(test_file) as fi:
+                        fo.write("print('running {0}');\n".format(name))
+                        fo.write("{0} --- {1} (begin) ---\n".format(comment_char, name))
+                        fo.write(fi.read())
+                        fo.write("{0} --- {1} (end) ---\n".format(comment_char, name))
+                except AttributeError:
+                    fo.write("# tests were not packaged with this module, and cannot be run\n")
+                fo.write("\nprint('===== %s OK =====');\n" % m.dist())
+    return (out_file, bool(name) and os.path.isfile(out_file) and os.path.basename(test_file) != 'no-file')
 
 
 def create_py_files(m, test_dir=None):
@@ -248,9 +239,20 @@ def create_lua_files(m, test_dir=None):
 
 
 def create_all_test_files(m, test_dir=None):
-    if not test_dir:
+    if test_dir:
+        rm_rf(test_dir)
+        os.makedirs(test_dir)
+        # this happens when we're finishing the build.
+        test_deps = m.meta.get('test', {}).get('requires', [])
+        if test_deps:
+            with open(os.path.join(test_dir, 'test_time_dependencies.json'), 'w') as f:
+                json.dump(test_deps, f)
+    else:
+        # this happens when we're running a package's tests
         test_dir = m.config.test_dir
+
     files = create_files(m, test_dir)
+
     pl_files = create_pl_files(m, test_dir)
     py_files = create_py_files(m, test_dir)
     r_files = create_r_files(m, test_dir)

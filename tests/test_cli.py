@@ -15,9 +15,11 @@ from conda_build.conda_interface import download, reset_context
 from conda_build.tarcheck import TarCheck
 
 from conda_build import api
+from conda_build.config import Config
 from conda_build.utils import (get_site_packages, on_win, get_build_folders, package_has_file,
                                check_call_env, tar_xf)
-from conda_build.conda_interface import TemporaryDirectory
+from conda_build.conda_interface import TemporaryDirectory, conda_43
+from conda_build.exceptions import DependencyNeedsBuildingError
 import conda_build
 from .utils import metadata_dir, put_bad_conda_on_path
 
@@ -31,22 +33,14 @@ import conda_build.cli.main_inspect as main_inspect
 import conda_build.cli.main_index as main_index
 
 
+@pytest.mark.sanity
 def test_build():
     args = ['--no-anaconda-upload', os.path.join(metadata_dir, "empty_sections"), '--no-activate',
             '--no-anaconda-upload']
     main_build.execute(args)
 
 
-# regression test for https://github.com/conda/conda-build/issues/1450
-def test_build_with_conda_not_on_path(testing_workdir):
-    with put_bad_conda_on_path(testing_workdir):
-        # using subprocess is not ideal, but it is the easiest way to ensure that PATH
-        #    is altered the way we want here.
-        check_call_env('conda-build {0} --no-anaconda-upload'.format(
-            os.path.join(metadata_dir, "python_run")).split(),
-                       env=os.environ)
-
-
+@pytest.mark.serial
 def test_build_add_channel():
     """This recipe requires the conda_build_test_requirement package, which is
     only on the conda_build_test channel. This verifies that the -c argument
@@ -57,13 +51,13 @@ def test_build_add_channel():
     main_build.execute(args)
 
 
-@pytest.mark.xfail
 def test_build_without_channel_fails(testing_workdir):
     # remove the conda forge channel from the arguments and make sure that we fail.  If we don't,
     #    we probably have channels in condarc, and this is not a good test.
     args = ['--no-anaconda-upload', '--no-activate',
             os.path.join(metadata_dir, "_recipe_requiring_external_channel")]
-    main_build.execute(args)
+    with pytest.raises(DependencyNeedsBuildingError):
+        main_build.execute(args)
 
 
 def test_render_add_channel():
@@ -75,7 +69,8 @@ def test_render_add_channel():
         args = ['-c', 'conda_build_test', os.path.join(metadata_dir,
                             "_recipe_requiring_external_channel"), '--file', rendered_filename]
         main_render.execute(args)
-        rendered_meta = yaml.safe_load(open(rendered_filename, 'r'))
+        with open(rendered_filename, 'r') as rendered_file:
+            rendered_meta = yaml.safe_load(rendered_file)
         required_package_string = [pkg for pkg in rendered_meta['requirements']['build'] if
                                    'conda_build_test_requirement' in pkg][0]
         required_package_details = required_package_string.split(' ')
@@ -88,10 +83,13 @@ def test_render_without_channel_fails():
     # do make extra channel available, so the required package should not be found
     with TemporaryDirectory() as tmpdir:
         rendered_filename = os.path.join(tmpdir, 'out.yaml')
-        args = ['--override-channels', '-c', 'conda', os.path.join(metadata_dir, "_recipe_requiring_external_channel"), '--file', rendered_filename]
+        args = ['--override-channels', os.path.join(metadata_dir, "_recipe_requiring_external_channel"), '--file', rendered_filename]
         main_render.execute(args)
-        rendered_meta = yaml.safe_load(open(rendered_filename, 'r'))
-        required_package_string = [pkg for pkg in rendered_meta['requirements']['build'] if 'conda_build_test_requirement' in pkg][0]
+        with open(rendered_filename, 'r') as rendered_file:
+            rendered_meta = yaml.safe_load(rendered_file)
+        required_package_string = [pkg for pkg in
+                                   rendered_meta.get('requirements', {}).get('build', [])
+                                   if 'conda_build_test_requirement' in pkg][0]
         assert required_package_string == 'conda_build_test_requirement', \
                "Expected to get only base package name because it should not be found, but got :{}".format(required_package_string)
 
@@ -112,29 +110,38 @@ def test_no_filename_hash(testing_workdir, testing_metadata, capfd):
 
 def test_render_output_build_path(testing_workdir, testing_metadata, capfd, caplog):
     api.output_yaml(testing_metadata, 'meta.yaml')
-    metadata = api.render(testing_workdir, debug=False, verbose=False)[0][0]
-    args = ['--output', os.path.join(testing_workdir)]
+    args = ['--output', testing_workdir]
     main_render.execute(args)
-    _hash = metadata.hash_dependencies()
     test_path = os.path.join(sys.prefix, "conda-bld", testing_metadata.config.host_subdir,
-                             "test_render_output_build_path-1.0-py{}{}{}_1.tar.bz2".format(
-                                 sys.version_info.major, sys.version_info.minor, _hash))
+                             "test_render_output_build_path-1.0-1.tar.bz2")
     output, error = capfd.readouterr()
     assert output.rstrip() == test_path, error
     assert error == ""
+
+
+def test_render_output_build_path_and_file(testing_workdir, testing_metadata, capfd, caplog):
+    api.output_yaml(testing_metadata, 'meta.yaml')
+    rendered_filename = 'out.yaml'
+    args = ['--output', '--file', rendered_filename, testing_workdir]
+    main_render.execute(args)
+    test_path = os.path.join(sys.prefix, "conda-bld", testing_metadata.config.host_subdir,
+                             "test_render_output_build_path_and_file-1.0-1.tar.bz2")
+    output, error = capfd.readouterr()
+    assert output.rstrip() == test_path, error
+    assert error == ""
+    with open(rendered_filename, 'r') as rendered_file:
+        rendered_meta = yaml.safe_load(rendered_file)
+    assert rendered_meta['package']['name'] == 'test_render_output_build_path_and_file'
 
 
 def test_build_output_build_path(testing_workdir, testing_metadata, testing_config, capfd):
     api.output_yaml(testing_metadata, 'meta.yaml')
     testing_config.verbose = False
     testing_config.debug = False
-    metadata = api.render(testing_workdir, config=testing_config)[0][0]
-    args = ['--output', os.path.join(testing_workdir)]
+    args = ['--output', testing_workdir]
     main_build.execute(args)
-    _hash = metadata.hash_dependencies()
     test_path = os.path.join(sys.prefix, "conda-bld", testing_config.host_subdir,
-                                  "test_build_output_build_path-1.0-py{}{}{}_1.tar.bz2".format(
-                                      sys.version_info.major, sys.version_info.minor, _hash))
+                                  "test_build_output_build_path-1.0-1.tar.bz2")
     output, error = capfd.readouterr()
     assert test_path == output.rstrip(), error
     assert error == ""
@@ -144,19 +151,13 @@ def test_build_output_build_path_multiple_recipes(testing_workdir, testing_metad
                                                   testing_config, capfd):
     api.output_yaml(testing_metadata, 'meta.yaml')
     testing_config.verbose = False
-    metadata = api.render(testing_workdir, config=testing_config)[0][0]
     skip_recipe = os.path.join(metadata_dir, "build_skip")
     args = ['--output', testing_workdir, skip_recipe]
 
     main_build.execute(args)
 
-    _hash = metadata.hash_dependencies()
     test_path = lambda pkg: os.path.join(sys.prefix, "conda-bld", testing_config.host_subdir, pkg)
-    test_paths = [test_path(
-        "test_build_output_build_path_multiple_recipes-1.0-py{}{}{}_1.tar.bz2".format(
-            sys.version_info.major, sys.version_info.minor, _hash)),
-        "Skipped: {} defines build/skip for this configuration ({{}}).".format(
-            os.path.abspath(skip_recipe))]
+    test_paths = [test_path("test_build_output_build_path_multiple_recipes-1.0-1.tar.bz2"), ]
 
     output, error = capfd.readouterr()
     # assert error == ""
@@ -167,15 +168,16 @@ def test_slash_in_recipe_arg_keeps_build_id(testing_workdir, testing_config):
     args = [os.path.join(metadata_dir, "has_prefix_files"), '--croot', testing_config.croot,
             '--no-anaconda-upload']
     outputs = main_build.execute(args)
-    data = package_has_file(outputs[0], 'binary-has-prefix')
+    data = package_has_file(outputs[0], 'binary-has-prefix', refresh=True)
     assert data
     if hasattr(data, 'decode'):
         data = data.decode('UTF-8')
     assert 'conda-build-test-has-prefix-files_1' in data
 
 
+@pytest.mark.sanity
 @pytest.mark.skipif(on_win, reason="prefix is always short on win.")
-def test_build_long_test_prefix_default_enabled(mocker, testing_workdir, testing_metadata):
+def test_build_long_test_prefix_default_enabled(mocker, testing_workdir):
     recipe_path = os.path.join(metadata_dir, '_test_long_test_prefix')
     args = [recipe_path, '--no-anaconda-upload']
     main_build.execute(args)
@@ -189,14 +191,13 @@ def test_build_no_build_id(testing_workdir, testing_config):
     args = [os.path.join(metadata_dir, "has_prefix_files"), '--no-build-id',
             '--croot', testing_config.croot, '--no-activate', '--no-anaconda-upload']
     outputs = main_build.execute(args)
-    data = package_has_file(outputs[0], 'binary-has-prefix')
+    data = package_has_file(outputs[0], 'binary-has-prefix', refresh=True)
     assert data
     if hasattr(data, 'decode'):
         data = data.decode('UTF-8')
     assert 'has_prefix_files_1' not in data
 
 
-@pytest.mark.serial
 def test_build_multiple_recipes(testing_metadata, testing_workdir, testing_config):
     """Test that building two recipes in one CLI call separates the build environment for each"""
     os.makedirs('recipe1')
@@ -233,6 +234,8 @@ def test_build_source(testing_workdir):
 
 
 def test_render_output_build_path_set_python(testing_workdir, testing_metadata, capfd):
+    testing_metadata.meta['requirements'] = {'host': ['python'],
+                                             'run': ['python']}
     api.output_yaml(testing_metadata, 'meta.yaml')
     # build the other major thing, whatever it is
     if sys.version_info.major == 3:
@@ -253,21 +256,17 @@ def test_render_output_build_path_set_python(testing_workdir, testing_metadata, 
     assert os.path.basename(output.rstrip()) == test_path, error
 
 
+@pytest.mark.sanity
 def test_skeleton_pypi(testing_workdir, testing_config):
-    args = ['pypi', 'click']
+    args = ['pypi', 'peppercorn']
     main_skeleton.execute(args)
-    assert os.path.isdir('click')
+    assert os.path.isdir('peppercorn')
 
     # ensure that recipe generated is buildable
-    args = ['click', '--no-anaconda-upload', '--croot', testing_config.croot, '--no-activate']
-    main_build.execute(args)
-    # output, error = capfd.readouterr()
-    # if hasattr(output, 'decode'):
-    #     output = output.decode()
-    # assert 'Nothing to test for' not in output
-    # assert 'Nothing to test for' not in error
+    main_build.execute(('peppercorn',))
 
 
+@pytest.mark.slow
 def test_skeleton_pypi_arguments_work(testing_workdir):
     """
     These checks whether skeleton executes without error when these
@@ -300,7 +299,7 @@ def test_metapackage(testing_config, testing_workdir):
     args = ['metapackage_test', '1.0', '-d', 'bzip2', '--no-anaconda-upload']
     main_metapackage.execute(args)
     test_path = glob(os.path.join(sys.prefix, "conda-bld", testing_config.host_subdir,
-                             'metapackage_test-1.0*_0.tar.bz2'))[0]
+                             'metapackage_test-1.0-0.tar.bz2'))[0]
     assert os.path.isfile(test_path)
 
 
@@ -310,7 +309,7 @@ def test_metapackage_build_number(testing_config, testing_workdir):
             '--no-anaconda-upload']
     main_metapackage.execute(args)
     test_path = glob(os.path.join(sys.prefix, "conda-bld", testing_config.host_subdir,
-                             'metapackage_test_build_number-1.0-*_1.tar.bz2'))[0]
+                             'metapackage_test_build_number-1.0-1.tar.bz2'))[0]
     assert os.path.isfile(test_path)
 
 
@@ -330,11 +329,11 @@ def test_metapackage_metadata(testing_config, testing_workdir):
     main_metapackage.execute(args)
 
     test_path = glob(os.path.join(sys.prefix, "conda-bld", testing_config.host_subdir,
-                             'metapackage_testing_metadata-1.0-*_0.tar.bz2'))[0]
+                             'metapackage_testing_metadata-1.0-0.tar.bz2'))[0]
     assert os.path.isfile(test_path)
-    info = json.loads(package_has_file(test_path, 'info/index.json').decode('utf-8'))
+    info = json.loads(package_has_file(test_path, 'info/index.json'))
     assert info['license'] == 'BSD'
-    info = json.loads(package_has_file(test_path, 'info/about.json').decode('utf-8'))
+    info = json.loads(package_has_file(test_path, 'info/about.json'))
     assert info['home'] == 'http://abc.com'
     assert info['summary'] == 'wee'
 
@@ -342,7 +341,7 @@ def test_metapackage_metadata(testing_config, testing_workdir):
 def testing_index(testing_workdir):
     args = ['.']
     main_index.execute(args)
-    assert os.path.isfile('repodata.json')
+    assert os.path.isfile('noarch/repodata.json')
 
 
 def test_inspect_installable(testing_workdir):
@@ -376,7 +375,6 @@ def test_inspect_objects(testing_workdir, capfd):
         assert re.search('rpath:.*@loader_path', output)
 
 
-@pytest.mark.serial
 @pytest.mark.skipif(on_win, reason="Windows prefix length doesn't matter (yet?)")
 def test_inspect_prefix_length(testing_workdir, capfd):
     from conda_build import api
@@ -385,7 +383,7 @@ def test_inspect_prefix_length(testing_workdir, capfd):
     config = api.Config(croot=test_base, anaconda_upload=False, verbose=True)
     recipe_path = os.path.join(metadata_dir, "has_prefix_files")
     config.prefix_length = 80
-    outputs = api.build(recipe_path, config=config)
+    outputs = api.build(recipe_path, config=config, notest=True)
 
     args = ['prefix-lengths'] + outputs
     with pytest.raises(SystemExit):
@@ -397,23 +395,25 @@ def test_inspect_prefix_length(testing_workdir, capfd):
     config.prefix_length = 255
     # reset the build id so that a new one is computed
     config._build_id = ""
-    api.build(recipe_path, config=config)
+    api.build(recipe_path, config=config, notest=True)
     main_inspect.execute(args)
     output, error = capfd.readouterr()
     assert 'No packages found with binary prefixes shorter' in output
 
 
-@pytest.mark.serial
 def test_inspect_hash_input(testing_metadata, testing_workdir, capfd):
+    testing_metadata.meta['requirements']['build'] = ['zlib']
     api.output_yaml(testing_metadata, 'meta.yaml')
-    output = api.build(testing_workdir)[0]
+    output = api.build(testing_workdir, notest=True)[0]
+    with open(os.path.join(testing_workdir, 'conda_build_config.yaml'), 'w') as f:
+        yaml.dump({'zlib': ['1.2.11']}, f)
     args = ['hash-inputs', output]
     main_inspect.execute(args)
     output, error = capfd.readouterr()
-    assert 'requirements' in output
+    assert 'zlib' in output
 
 
-@pytest.mark.serial
+@pytest.mark.xfail(conda_43, reason="develop broke with old conda.  We don't really care.")
 def test_develop(testing_env):
     f = "https://pypi.io/packages/source/c/conda_version_test/conda_version_test-0.1.0-1.tar.gz"
     download(f, "conda_version_test.tar.gz")
@@ -423,16 +423,17 @@ def test_develop(testing_env):
     args = ['-p', testing_env, extract_folder]
     main_develop.execute(args)
     py_ver = '.'.join((str(sys.version_info.major), str(sys.version_info.minor)))
-    assert cwd in open(os.path.join(get_site_packages(testing_env, py_ver), 'conda.pth')).read()
+    with open(os.path.join(get_site_packages(testing_env, py_ver), 'conda.pth')) as f_pth:
+        assert cwd in f_pth.read()
     args = ['--uninstall', '-p', testing_env, extract_folder]
     main_develop.execute(args)
-    assert (cwd not in open(os.path.join(get_site_packages(testing_env, py_ver),
-                                         'conda.pth')).read())
+    with open(os.path.join(get_site_packages(testing_env, py_ver), 'conda.pth')) as f_pth:
+        assert cwd not in f_pth.read()
 
 
 def test_convert(testing_workdir, testing_config):
     # download a sample py2.7 package
-    f = 'https://repo.continuum.io/pkgs/free/win-64/affine-2.0.0-py27_0.tar.bz2'
+    f = 'https://repo.anaconda.com/pkgs/free/win-64/affine-2.0.0-py27_0.tar.bz2'
     pkg_name = "affine-2.0.0-py27_0.tar.bz2"
     download(f, pkg_name)
     # convert it to all platforms
@@ -459,7 +460,7 @@ def test_purge(testing_workdir, testing_metadata):
     It does not clear out build packages from folders like osx-64 or linux-64.
     """
     api.output_yaml(testing_metadata, 'meta.yaml')
-    outputs = api.build(testing_workdir)
+    outputs = api.build(testing_workdir, notest=True)
     args = ['purge']
     main_build.execute(args)
     dirs = get_build_folders(testing_metadata.config.croot)
@@ -476,7 +477,7 @@ def test_purge_all(testing_workdir, testing_metadata):
     api.output_yaml(testing_metadata, 'meta.yaml')
     with TemporaryDirectory() as tmpdir:
         testing_metadata.config.croot = tmpdir
-        outputs = api.build(testing_workdir, config=testing_metadata.config)
+        outputs = api.build(testing_workdir, config=testing_metadata.config, notest=True)
         args = ['purge-all', '--croot', tmpdir]
         main_build.execute(args)
         assert not get_build_folders(testing_metadata.config.croot)
@@ -503,14 +504,16 @@ def test_no_force_upload(mocker, testing_workdir, testing_metadata):
     assert call.called_once_with(['anaconda', 'upload', '--force', pkg])
 
 
+@pytest.mark.slow
 def test_conda_py_no_period(testing_workdir, testing_metadata, monkeypatch):
-    monkeypatch.setenv('CONDA_PY', '34')
+    monkeypatch.setenv('CONDA_PY', '36')
+    testing_metadata.meta['requirements'] = {'host': ['python'],
+                                             'run': ['python']}
     api.output_yaml(testing_metadata, 'meta.yaml')
-    outputs = api.build(testing_workdir)
-    assert any('py34' in output for output in outputs)
+    outputs = api.build(testing_workdir, notest=True)
+    assert any('py36' in output for output in outputs)
 
 
-@pytest.mark.serial
 def test_build_skip_existing(testing_workdir, capfd, mocker):
     # build the recipe first
     empty_sections = os.path.join(metadata_dir, "empty_sections")
@@ -525,7 +528,6 @@ def test_build_skip_existing(testing_workdir, capfd, mocker):
     assert ("are already built" in output or "are already built" in error)
 
 
-@pytest.mark.serial
 def test_build_skip_existing_croot(testing_workdir, capfd):
     # build the recipe first
     empty_sections = os.path.join(metadata_dir, "empty_sections")
@@ -537,7 +539,7 @@ def test_build_skip_existing_croot(testing_workdir, capfd):
     assert "are already built" in output
 
 
-@pytest.mark.serial
+@pytest.mark.sanity
 def test_package_test(testing_workdir, testing_metadata):
     """Test calling conda build -t <package file> - rather than <recipe dir>"""
     api.output_yaml(testing_metadata, 'recipe/meta.yaml')
@@ -546,7 +548,6 @@ def test_package_test(testing_workdir, testing_metadata):
     main_build.execute(args)
 
 
-@pytest.mark.serial
 def test_activate_scripts_not_included(testing_workdir):
     recipe = os.path.join(metadata_dir, '_activate_scripts_not_included')
     args = ['--no-anaconda-upload', '--croot', testing_workdir, recipe]
@@ -559,7 +560,6 @@ def test_activate_scripts_not_included(testing_workdir):
         assert not package_has_file(out, f)
 
 
-@pytest.mark.serial
 def test_relative_path_croot():
     # this tries to build a package while specifying the croot with a relative path:
     # conda-build --no-test --croot ./relative/path
@@ -573,7 +573,6 @@ def test_relative_path_croot():
     assert os.path.isfile(outputfile[0])
 
 
-@pytest.mark.serial
 def test_relative_path_test_artifact():
     # this test builds a package into (cwd)/relative/path and then calls:
     # conda-build --test ./relative/path/{platform}/{artifact}.tar.bz2
@@ -594,7 +593,6 @@ def test_relative_path_test_artifact():
     main_build.execute(args)
 
 
-@pytest.mark.serial
 def test_relative_path_test_recipe():
     # this test builds a package into (cwd)/relative/path and then calls:
     # conda-build --test --croot ./relative/path/ /abs/path/to/recipe
@@ -613,7 +611,7 @@ def test_relative_path_test_recipe():
     main_build.execute(args)
 
 
-@pytest.mark.serial
+@pytest.mark.slow
 def test_render_with_python_arg_reduces_subspace(capfd):
     recipe = os.path.join(metadata_dir, "..", "variants", "20_subspace_selection_cli")
     # build the package
@@ -622,13 +620,79 @@ def test_render_with_python_arg_reduces_subspace(capfd):
     out, err = capfd.readouterr()
     assert(len(out.splitlines()) == 2)
 
-    args = [recipe, '--python=3.5', '--output']
+    args = [recipe, '--python=3.6', '--output']
     main_render.execute(args)
     out, err = capfd.readouterr()
     assert(len(out.splitlines()) == 1)
 
-    # should raise an error, because python 3.6 is not in the matrix, so we don't know which vc
+    # should raise an error, because python 3.4 is not in the matrix, so we don't know which vc
     # to associate with
-    args = [recipe, '--python=3.6', '--output']
+    args = [recipe, '--python=3.4', '--output']
     with pytest.raises(ValueError):
         main_render.execute(args)
+
+
+def test_render_with_python_arg_CLI_reduces_subspace(capfd):
+    recipe = os.path.join(metadata_dir, "..", "variants", "20_subspace_selection_cli")
+    # build the package
+    args = [recipe, '--variants', '{python: [2.7, 3.6]}', '--output']
+    main_render.execute(args)
+    out, err = capfd.readouterr()
+    assert(len(out.splitlines()) == 3)
+
+    args = [recipe, '--variants', '{python: 2.7}', '--output']
+    main_render.execute(args)
+    out, err = capfd.readouterr()
+    assert(len(out.splitlines()) == 2)
+
+    args = [recipe, '--variants', '{python: 3.6}', '--output']
+    main_render.execute(args)
+    out, err = capfd.readouterr()
+    assert(len(out.splitlines()) == 1)
+
+
+def test_test_extra_dep(testing_metadata):
+    testing_metadata.meta['test']['imports'] = ['imagesize']
+    api.output_yaml(testing_metadata, 'meta.yaml')
+    output = api.build(testing_metadata, notest=True, anaconda_upload=False)[0]
+
+    # tests version constraints.  CLI would quote this - "click <6.7"
+    args = [output, '-t', '--extra-deps', 'imagesize <1.0']
+    # extra_deps will add it in
+    main_build.execute(args)
+
+    # missing click dep will fail tests
+    with pytest.raises(SystemExit):
+        args = [output, '-t']
+        # extra_deps will add it in
+        main_build.execute(args)
+
+
+@pytest.mark.parametrize(
+    'additional_args, is_long_test_prefix',
+    [
+        ([], True),
+        (['--long-test-prefix'], True),
+        (['--no-long-test-prefix'], False)
+    ],
+)
+def test_long_test_prefix(additional_args, is_long_test_prefix):
+    args = ['non_existing_recipe'] + additional_args
+    parser, args = main_build.parse_args(args)
+    config = Config(**args.__dict__)
+    assert config.long_test_prefix is is_long_test_prefix
+
+
+def test_user_warning(tmpdir, recwarn):
+    dir_recipe_path = tmpdir.mkdir("recipe-path")
+    recipe = dir_recipe_path.join("meta.yaml")
+    recipe.write("")
+
+    main_build.parse_args([str(recipe)])
+    assert "RECIPE_PATH received is a file. File: {}\n" \
+           "It should be a path to a folder. \n" \
+           "Forcing conda-build to use the recipe file.".format(str(recipe))\
+           == str(recwarn.pop(UserWarning).message)
+
+    main_build.parse_args([str(dir_recipe_path)])
+    assert not recwarn.list

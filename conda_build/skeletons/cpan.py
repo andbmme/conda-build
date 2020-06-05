@@ -67,12 +67,14 @@ about:
   summary: {summary}
 
 # See
-# http://docs.continuum.io/conda/build.html for
+# https://docs.conda.io/projects/conda-build for
 # more information about meta.yaml
 """
 
 CPAN_BUILD_SH = """\
 #!/bin/bash
+
+set -o errexit -o pipefail
 
 # If it has Build.PL use that, otherwise use Makefile.PL
 if [ -f Build.PL ]; then
@@ -95,7 +97,7 @@ fi
 # Add more build steps here, if they are necessary.
 
 # See
-# http://docs.continuum.io/conda/build.html
+# https://docs.conda.io/projects/conda-build
 # for a list of environment variables that are set during the build process.
 """
 
@@ -127,7 +129,7 @@ IF exist Build.PL (
 :: Add more build steps here, if they are necessary.
 
 :: See
-:: http://docs.continuum.io/conda/build.html
+:: https://docs.conda.io/projects/conda-build
 :: for a list of environment variables that are set during the build process.
 """
 
@@ -207,6 +209,7 @@ def package_exists(package_name):
         cmd = ['cpan', '-D', package_name]
         if on_win:
             cmd.insert(0, '/c')
+            cmd.insert(0, '/d')
             cmd.insert(0, 'cmd.exe')
         check_call_env(cmd)
         in_repo = True
